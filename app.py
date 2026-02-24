@@ -73,20 +73,40 @@ def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
 
 
 def _load_new_csv(uploaded_file) -> pd.DataFrame:
-    try:
-        return pd.read_csv(uploaded_file)
-    except UnicodeDecodeError:
-        try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding="latin-1")
-        except Exception as exc:  # noqa: BLE001
-            st.error("Could not decode the CSV file. Save it as UTF-8 CSV and upload again.")
-            st.caption(f"Parser detail: {exc}")
-            st.stop()
-    except Exception as exc:  # noqa: BLE001
-        st.error("Unexpected error while reading the CSV file.")
-        st.caption(f"Parser detail: {exc}")
+    raw_bytes = uploaded_file.getvalue()
+    if not raw_bytes:
+        st.error("The uploaded CSV is empty. Upload a non-empty .csv file.")
         st.stop()
+
+    parse_attempts: list[str] = []
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            # Robust parse: auto-detect delimiter and handle quoted fields reliably.
+            return pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, sep=None, engine="python")
+        except Exception as exc:  # noqa: BLE001
+            parse_attempts.append(f"{encoding} strict parse failed: {exc}")
+
+        try:
+            # Tolerant fallback for malformed bank exports with inconsistent row shapes.
+            df = pd.read_csv(
+                io.BytesIO(raw_bytes),
+                encoding=encoding,
+                sep=None,
+                engine="python",
+                on_bad_lines="skip",
+            )
+            st.warning(
+                "CSV had malformed rows; some lines were skipped during import. "
+                "Please verify the imported transactions before approving merge."
+            )
+            return df
+        except Exception as exc:  # noqa: BLE001
+            parse_attempts.append(f"{encoding} tolerant parse failed: {exc}")
+
+    st.error("Unexpected error while reading the CSV file.")
+    for detail in parse_attempts:
+        st.caption(f"Parser detail: {detail}")
+    st.stop()
 
 
 def _prepare_rows_for_master(
