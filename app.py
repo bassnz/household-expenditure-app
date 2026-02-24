@@ -50,20 +50,25 @@ def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
         )
         st.stop()
 
+    openpyxl_exc = None
     try:
-        # Explicit engine keeps behavior stable across pandas versions.
+        # Primary parser.
         return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
     except (ValueError, BadZipFile) as exc:
-        st.error(
-            "Could not read the historical workbook. "
-            "Make sure it is a real .xlsx file (not renamed .csv/.xls), not password-protected, "
-            "and re-save it in Excel/Google Sheets as .xlsx, then upload again."
-        )
-        st.caption(f"Parser detail: {exc}")
-        st.stop()
+        openpyxl_exc = exc
     except Exception as exc:  # noqa: BLE001
-        st.error("Unexpected error while reading the historical workbook.")
-        st.caption(f"Parser detail: {exc}")
+        openpyxl_exc = exc
+
+    # Fallback parser for workbooks that openpyxl rejects but are still valid.
+    try:
+        return pd.read_excel(io.BytesIO(raw_bytes), engine="calamine")
+    except Exception as calamine_exc:  # noqa: BLE001
+        st.error(
+            "Could not read the historical workbook with either parser. "
+            "Please re-save it as a standard .xlsx workbook and try again."
+        )
+        st.caption(f"openpyxl detail: {openpyxl_exc}")
+        st.caption(f"calamine detail: {calamine_exc}")
         st.stop()
 
 
