@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from datetime import datetime
+from zipfile import BadZipFile, ZipFile
 from typing import Optional
 
 import pandas as pd
@@ -23,6 +24,64 @@ def _pick_column(label: str, columns: list[str], default_candidates: list[str]) 
             default_idx = lowered.index(candidate)
             break
     return st.selectbox(label, options=columns, index=default_idx)
+
+
+def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
+    raw_bytes = uploaded_file.getvalue()
+    if not raw_bytes:
+        st.error("The uploaded workbook is empty. Upload a non-empty .xlsx file.")
+        st.stop()
+
+    try:
+        with ZipFile(io.BytesIO(raw_bytes)) as zf:
+            names = set(zf.namelist())
+    except BadZipFile:
+        st.error(
+            "This file is not a valid .xlsx workbook package. "
+            "Please open it and re-save as Excel Workbook (.xlsx), then upload again."
+        )
+        st.stop()
+
+    required_entries = {"[Content_Types].xml", "xl/workbook.xml"}
+    if not required_entries.issubset(names):
+        st.error(
+            "The uploaded file is missing required .xlsx workbook parts. "
+            "Please re-save it as a standard .xlsx file and try again."
+        )
+        st.stop()
+
+    try:
+        # Explicit engine keeps behavior stable across pandas versions.
+        return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
+    except (ValueError, BadZipFile) as exc:
+        st.error(
+            "Could not read the historical workbook. "
+            "Make sure it is a real .xlsx file (not renamed .csv/.xls), not password-protected, "
+            "and re-save it in Excel/Google Sheets as .xlsx, then upload again."
+        )
+        st.caption(f"Parser detail: {exc}")
+        st.stop()
+    except Exception as exc:  # noqa: BLE001
+        st.error("Unexpected error while reading the historical workbook.")
+        st.caption(f"Parser detail: {exc}")
+        st.stop()
+
+
+def _load_new_csv(uploaded_file) -> pd.DataFrame:
+    try:
+        return pd.read_csv(uploaded_file)
+    except UnicodeDecodeError:
+        try:
+            uploaded_file.seek(0)
+            return pd.read_csv(uploaded_file, encoding="latin-1")
+        except Exception as exc:  # noqa: BLE001
+            st.error("Could not decode the CSV file. Save it as UTF-8 CSV and upload again.")
+            st.caption(f"Parser detail: {exc}")
+            st.stop()
+    except Exception as exc:  # noqa: BLE001
+        st.error("Unexpected error while reading the CSV file.")
+        st.caption(f"Parser detail: {exc}")
+        st.stop()
 
 
 def _prepare_rows_for_master(
@@ -60,8 +119,8 @@ if not history_file or not new_csv_file:
     st.info("Upload both files to continue.")
     st.stop()
 
-history_df = pd.read_excel(history_file)
-new_df = pd.read_csv(new_csv_file)
+history_df = _load_history_xlsx(history_file)
+new_df = _load_new_csv(new_csv_file)
 
 st.subheader("2) Map Columns")
 col_left, col_right = st.columns(2)
