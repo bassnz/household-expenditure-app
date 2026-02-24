@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import csv
 import io
 from datetime import datetime
-from zipfile import BadZipFile, ZipFile
 from typing import Optional
+from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
 import streamlit as st
@@ -11,19 +12,79 @@ import streamlit as st
 from categorizer import build_historical_model, predict_categories
 
 
+TYPE1_HEADERS = [
+    "Date Processed",
+    "Date of Transaction",
+    "Unique Id",
+    "Tran Type",
+    "Reference",
+    "Description",
+    "Amount",
+]
+
+TYPE2_HEADERS = [
+    "Date",
+    "Unique Id",
+    "Tran Type",
+    "Cheque Number",
+    "Payee",
+    "Memo",
+    "Amount",
+]
+
+CATEGORY_COL = "Categorisation"
+
+
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
 st.title("Transaction Categorizer")
 st.caption("Upload historical .xlsx data + a new .csv file, review predicted categories, approve, then merge.")
 
 
-def _pick_column(label: str, columns: list[str], default_candidates: list[str]) -> Optional[str]:
-    default_idx = 0
-    lowered = [c.lower() for c in columns]
-    for candidate in default_candidates:
-        if candidate in lowered:
-            default_idx = lowered.index(candidate)
-            break
-    return st.selectbox(label, options=columns, index=default_idx)
+def _read_text_bytes(raw_bytes: bytes) -> str:
+    for enc in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return raw_bytes.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Could not decode CSV bytes with utf-8 or latin-1")
+
+
+def _detect_csv_header_row(raw_text: str) -> tuple[int, str]:
+    reader = csv.reader(io.StringIO(raw_text))
+    for idx, row in enumerate(reader):
+        clean = [c.strip() for c in row]
+        if clean == TYPE1_HEADERS:
+            return idx, "type1"
+        if clean == TYPE2_HEADERS:
+            return idx, "type2"
+    raise ValueError(
+        "CSV headers not recognized. Expected one of the two supported bank formats."
+    )
+
+
+def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
+    raw_bytes = uploaded_file.getvalue()
+    if not raw_bytes:
+        raise ValueError("The uploaded CSV is empty.")
+
+    raw_text = _read_text_bytes(raw_bytes)
+    header_row_idx, csv_type = _detect_csv_header_row(raw_text)
+
+    df = pd.read_csv(
+        io.StringIO(raw_text),
+        skiprows=header_row_idx,
+        engine="python",
+        on_bad_lines="skip",
+    )
+
+    expected = TYPE1_HEADERS if csv_type == "type1" else TYPE2_HEADERS
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV is missing required columns: {missing}")
+
+    # Keep only known columns for that native format.
+    df = df[expected].copy()
+    return df, csv_type
 
 
 def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
@@ -52,14 +113,10 @@ def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
 
     openpyxl_exc = None
     try:
-        # Primary parser.
         return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
-    except (ValueError, BadZipFile) as exc:
-        openpyxl_exc = exc
     except Exception as exc:  # noqa: BLE001
         openpyxl_exc = exc
 
-    # Fallback parser for workbooks that openpyxl rejects but are still valid.
     try:
         return pd.read_excel(io.BytesIO(raw_bytes), engine="calamine")
     except Exception as calamine_exc:  # noqa: BLE001
@@ -72,67 +129,78 @@ def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
         st.stop()
 
 
-def _load_new_csv(uploaded_file) -> pd.DataFrame:
-    raw_bytes = uploaded_file.getvalue()
-    if not raw_bytes:
-        st.error("The uploaded CSV is empty. Upload a non-empty .csv file.")
-        st.stop()
-
-    parse_attempts: list[str] = []
-    for encoding in ("utf-8", "latin-1"):
-        try:
-            # Robust parse: auto-detect delimiter and handle quoted fields reliably.
-            return pd.read_csv(io.BytesIO(raw_bytes), encoding=encoding, sep=None, engine="python")
-        except Exception as exc:  # noqa: BLE001
-            parse_attempts.append(f"{encoding} strict parse failed: {exc}")
-
-        try:
-            # Tolerant fallback for malformed bank exports with inconsistent row shapes.
-            df = pd.read_csv(
-                io.BytesIO(raw_bytes),
-                encoding=encoding,
-                sep=None,
-                engine="python",
-                on_bad_lines="skip",
-            )
-            st.warning(
-                "CSV had malformed rows; some lines were skipped during import. "
-                "Please verify the imported transactions before approving merge."
-            )
-            return df
-        except Exception as exc:  # noqa: BLE001
-            parse_attempts.append(f"{encoding} tolerant parse failed: {exc}")
-
-    st.error("Unexpected error while reading the CSV file.")
-    for detail in parse_attempts:
-        st.caption(f"Parser detail: {detail}")
-    st.stop()
+def _first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
+    lookup = {c.lower(): c for c in cols}
+    for c in candidates:
+        found = lookup.get(c.lower())
+        if found:
+            return found
+    return None
 
 
-def _prepare_rows_for_master(
-    edited_df: pd.DataFrame,
-    history_columns: list[str],
-    hist_desc_col: str,
-    new_desc_col: str,
-    hist_category_col: str,
-    new_merchant_col: Optional[str],
-    hist_merchant_col: Optional[str],
-    new_amount_col: Optional[str],
-    hist_amount_col: Optional[str],
-) -> pd.DataFrame:
-    rows = pd.DataFrame(columns=history_columns)
+def _prepare_history_for_model(history_df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+    category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
+    if not category_col:
+        raise ValueError(
+            "Historical workbook needs a category column. Add a 'Categorisation' column with past labels."
+        )
 
-    # Map selected CSV columns into the corresponding master-sheet columns.
-    rows[hist_desc_col] = edited_df[new_desc_col]
-    rows[hist_category_col] = edited_df["PredictedCategory"]
+    desc_col = _first_existing(history_df.columns.tolist(), ["Description", "Memo", "Reference"])
+    merchant_col = _first_existing(history_df.columns.tolist(), ["Payee", "Description"])
+    amount_col = _first_existing(history_df.columns.tolist(), ["Amount"])
 
-    if hist_merchant_col and new_merchant_col:
-        rows[hist_merchant_col] = edited_df[new_merchant_col]
+    if not desc_col:
+        raise ValueError("Historical workbook needs at least one description-like column (Description/Memo/Reference).")
 
-    if hist_amount_col and new_amount_col:
-        rows[hist_amount_col] = edited_df[new_amount_col]
+    model_df = history_df.copy()
+    model_df["_model_desc"] = model_df[desc_col].fillna("").astype(str)
 
-    return rows.reindex(columns=history_columns)
+    if "Reference" in model_df.columns and desc_col != "Reference":
+        model_df["_model_desc"] = (
+            model_df["_model_desc"] + " " + model_df["Reference"].fillna("").astype(str)
+        ).str.strip()
+
+    if merchant_col:
+        model_df["_model_merchant"] = model_df[merchant_col]
+    else:
+        model_df["_model_merchant"] = ""
+
+    if amount_col:
+        model_df["_model_amount"] = model_df[amount_col]
+    else:
+        model_df["_model_amount"] = pd.NA
+
+    return model_df, category_col
+
+
+def _prepare_new_for_model(new_df: pd.DataFrame, csv_type: str) -> pd.DataFrame:
+    work = new_df.copy()
+    if csv_type == "type1":
+        work["_model_desc"] = (
+            work["Description"].fillna("").astype(str) + " " + work["Reference"].fillna("").astype(str)
+        ).str.strip()
+        work["_model_merchant"] = work["Description"]
+    else:
+        work["_model_desc"] = (
+            work["Payee"].fillna("").astype(str) + " " + work["Memo"].fillna("").astype(str)
+        ).str.strip()
+        work["_model_merchant"] = work["Payee"]
+
+    work["_model_amount"] = work["Amount"]
+    return work
+
+
+def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
+    history = history_df.copy()
+    if CATEGORY_COL not in history.columns:
+        history[CATEGORY_COL] = pd.NA
+
+    incoming = edited_df.copy()
+    incoming[CATEGORY_COL] = incoming["PredictedCategory"]
+    incoming = incoming.drop(columns=["PredictedCategory", "PredictionReason"], errors="ignore")
+
+    all_columns = list(dict.fromkeys(history.columns.tolist() + incoming.columns.tolist()))
+    return pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
 
 
 with st.sidebar:
@@ -145,50 +213,40 @@ if not history_file or not new_csv_file:
     st.stop()
 
 history_df = _load_history_xlsx(history_file)
-new_df = _load_new_csv(new_csv_file)
 
-st.subheader("2) Map Columns")
-col_left, col_right = st.columns(2)
-with col_left:
-    st.markdown("**Historical (.xlsx) columns**")
-    hist_desc_col = _pick_column("Description", history_df.columns.tolist(), ["description", "details", "memo"])
-    hist_category_col = _pick_column("Category", history_df.columns.tolist(), ["category", "type"])
-    hist_merchant_col = st.selectbox("Merchant (optional)", options=["<none>"] + history_df.columns.tolist())
-    hist_amount_col = st.selectbox("Amount (optional)", options=["<none>"] + history_df.columns.tolist())
+try:
+    new_df, csv_type = _load_supported_csv(new_csv_file)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
 
-with col_right:
-    st.markdown("**New (.csv) columns**")
-    new_desc_col = _pick_column("Description", new_df.columns.tolist(), ["description", "details", "memo"])
-    new_merchant_col = st.selectbox("Merchant (optional)", options=["<none>"] + new_df.columns.tolist())
-    new_amount_col = st.selectbox("Amount (optional)", options=["<none>"] + new_df.columns.tolist())
-
-hist_merchant_col = None if hist_merchant_col == "<none>" else hist_merchant_col
-hist_amount_col = None if hist_amount_col == "<none>" else hist_amount_col
-new_merchant_col = None if new_merchant_col == "<none>" else new_merchant_col
-new_amount_col = None if new_amount_col == "<none>" else new_amount_col
+st.subheader("2) Auto-Categorization")
+st.caption(f"Detected CSV format: {csv_type}")
 
 if st.button("Run Auto-Categorization", type="primary"):
     try:
+        history_model_df, history_category_col = _prepare_history_for_model(history_df)
+        new_model_df = _prepare_new_for_model(new_df, csv_type)
+
         model = build_historical_model(
-            history_df=history_df,
-            description_col=hist_desc_col,
-            merchant_col=hist_merchant_col,
-            amount_col=hist_amount_col,
-            category_col=hist_category_col,
+            history_df=history_model_df,
+            description_col="_model_desc",
+            merchant_col="_model_merchant",
+            amount_col="_model_amount",
+            category_col=history_category_col,
         )
         predicted_df, predicted_categories = predict_categories(
-            new_df=new_df,
+            new_df=new_model_df,
             model=model,
-            description_col=new_desc_col,
-            merchant_col=new_merchant_col,
-            amount_col=new_amount_col,
+            description_col="_model_desc",
+            merchant_col="_model_merchant",
+            amount_col="_model_amount",
         )
     except ValueError as exc:
         st.error(str(exc))
     else:
         st.session_state["predicted_df"] = predicted_df
         st.session_state["predicted_categories"] = predicted_categories
-        st.session_state["hist_category_col"] = hist_category_col
 
 if "predicted_df" not in st.session_state:
     st.stop()
@@ -199,12 +257,14 @@ st.write("Edit any category before approval.")
 predicted_df = st.session_state["predicted_df"].copy()
 categories = st.session_state["predicted_categories"]
 
-# Ensure dropdown values include everything currently present
-current_values = sorted({str(v) for v in predicted_df["PredictedCategory"].dropna().astype(str)})
+# Hide model helper columns from review grid.
+review_df = predicted_df.drop(columns=["_model_desc", "_model_merchant", "_model_amount"], errors="ignore")
+
+current_values = sorted({str(v) for v in review_df["PredictedCategory"].dropna().astype(str)})
 category_options = sorted(set(categories + current_values))
 
 edited_df = st.data_editor(
-    predicted_df,
+    review_df,
     use_container_width=True,
     num_rows="fixed",
     column_config={
@@ -216,29 +276,9 @@ edited_df = st.data_editor(
     },
 )
 
-st.session_state["edited_df"] = edited_df
-
 approve = st.checkbox("I approve these categories and want to merge into the master workbook")
 if approve and st.button("Merge into Master Workbook", type="primary"):
-    hist_category_col = st.session_state["hist_category_col"]
-    rows_to_append = _prepare_rows_for_master(
-        edited_df=edited_df,
-        history_columns=history_df.columns.tolist(),
-        hist_desc_col=hist_desc_col,
-        new_desc_col=new_desc_col,
-        hist_category_col=hist_category_col,
-        new_merchant_col=new_merchant_col,
-        hist_merchant_col=hist_merchant_col,
-        new_amount_col=new_amount_col,
-        hist_amount_col=hist_amount_col,
-    )
-    merged = pd.concat(
-        [
-            history_df,
-            rows_to_append,
-        ],
-        ignore_index=True,
-    )
+    merged = _merge_for_export(history_df, edited_df)
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
