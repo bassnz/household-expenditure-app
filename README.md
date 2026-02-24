@@ -41,6 +41,8 @@ streamlit run app.py
 ## Notes
 
 - Historical workbook should contain prior labels in `Categorisation` (or `Category`).
+- The uploaded historical `.xlsx` is treated as the source of truth for initial category mappings.
+- The app builds/refreshes `categorisation_reference.csv` from that workbook and then appends newly approved mappings after each run.
 - Prediction order is: description match -> merchant match -> amount similarity -> fallback most-common category.
 - The app displays the reference database grouped by category:
   - CSV type 1: `Description`

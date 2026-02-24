@@ -45,6 +45,7 @@ REFERENCE_DB_COLUMNS = [
     "ModelMerchant",
     "LastUpdated",
 ]
+REFERENCE_DB_DEDUPE_KEYS = [CATEGORY_COL, "CSVType", "Description", "Payee", "Memo", "ModelDesc", "ModelMerchant"]
 
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
@@ -172,6 +173,17 @@ def _save_reference_db(df: pd.DataFrame) -> None:
     clean.to_csv(REFERENCE_DB_PATH, index=False)
 
 
+def _dedupe_reference_rows(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
+    out = df.copy()
+    for col in REFERENCE_DB_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out = out[REFERENCE_DB_COLUMNS]
+    return out.drop_duplicates(subset=REFERENCE_DB_DEDUPE_KEYS, keep="last")
+
+
 def _extract_reference_rows(df: pd.DataFrame, csv_type: str, category_col: str) -> pd.DataFrame:
     if category_col not in df.columns:
         return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
@@ -224,23 +236,16 @@ def _reference_to_model_df(reference_df: pd.DataFrame) -> pd.DataFrame:
     return model_df.dropna(subset=[CATEGORY_COL, "_model_desc"])
 
 
-def _bootstrap_reference_db_from_history(history_df: pd.DataFrame, category_col: str) -> None:
-    if REFERENCE_DB_PATH.exists():
-        return
+def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -> pd.DataFrame:
     seeds = []
-    if {"Description", "Reference"}.issubset(history_df.columns):
+    if "Description" in history_df.columns:
         seeds.append(_extract_reference_rows(history_df, "type1", category_col))
     if {"Payee", "Memo"}.issubset(history_df.columns):
         seeds.append(_extract_reference_rows(history_df, "type2", category_col))
     if not seeds:
-        return
+        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
     seed_df = pd.concat(seeds, ignore_index=True) if seeds else pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    if seed_df.empty:
-        return
-    try:
-        _save_reference_db(seed_df)
-    except Exception:  # noqa: BLE001
-        pass
+    return _dedupe_reference_rows(seed_df)
 
 
 def _render_reference_view(reference_df: pd.DataFrame) -> None:
@@ -356,14 +361,35 @@ except ValueError as exc:
 st.subheader("2) Auto-Categorization")
 st.caption(f"Detected CSV format: {csv_type}")
 
-reference_df = _load_reference_db()
+try:
+    history_model_df, history_category_col = _prepare_history_for_model(history_df)
+except ValueError as exc:
+    st.error(str(exc))
+    st.stop()
+
+# Source-of-truth reference rows come from the historical workbook.
+history_reference_df = _build_reference_from_history(history_df, history_category_col)
+repo_reference_df = _load_reference_db()
+reference_df = _dedupe_reference_rows(pd.concat([repo_reference_df, history_reference_df], ignore_index=True))
+
+# Ensure the repository reference file exists and stays in sync with history-derived mappings.
+reference_sync_error = None
+reference_needs_write = (not REFERENCE_DB_PATH.exists()) or (len(reference_df) != len(repo_reference_df))
+if reference_needs_write:
+    try:
+        _save_reference_db(reference_df)
+    except Exception as exc:  # noqa: BLE001
+        reference_sync_error = exc
+
+st.caption("Categorisations in the uploaded .xlsx are treated as the initial source of truth.")
+if reference_sync_error:
+    st.warning("Reference DB could not be written in this runtime. Use the download button to persist it to your repo.")
+    st.caption(f"Save detail: {reference_sync_error}")
+
 _render_reference_view(reference_df)
 
 if st.button("Run Auto-Categorization", type="primary"):
     try:
-        history_model_df, history_category_col = _prepare_history_for_model(history_df)
-        _bootstrap_reference_db_from_history(history_df, history_category_col)
-        reference_df = _load_reference_db()
         ref_model_df = _reference_to_model_df(reference_df)
         if history_category_col != CATEGORY_COL and CATEGORY_COL in ref_model_df.columns:
             ref_model_df[history_category_col] = ref_model_df[CATEGORY_COL]
@@ -425,11 +451,7 @@ if approve and st.button("Merge into Master Workbook", type="primary"):
     csv_type_for_save = st.session_state.get("csv_type", csv_type)
 
     new_refs = _extract_reference_rows(edited_df, csv_type_for_save, "PredictedCategory")
-    all_refs = pd.concat([_load_reference_db(), new_refs], ignore_index=True)
-    all_refs = all_refs.drop_duplicates(
-        subset=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo", "ModelDesc", "ModelMerchant"],
-        keep="last",
-    )
+    all_refs = _dedupe_reference_rows(pd.concat([reference_df, new_refs], ignore_index=True))
     ref_save_error = None
     try:
         _save_reference_db(all_refs)
