@@ -7,6 +7,7 @@ A Streamlit app that:
 4. Auto-categorizes using historical patterns.
 5. Pauses for manual review/approval.
 6. Merges approved rows into an updated master workbook and writes a `Categorisation` column.
+7. Stores approved text-to-category mappings in `categorisation_reference.csv` for future learning.
 
 ## Supported CSV Headers
 
@@ -41,4 +42,7 @@ streamlit run app.py
 
 - Historical workbook should contain prior labels in `Categorisation` (or `Category`).
 - Prediction order is: description match -> merchant match -> amount similarity -> fallback most-common category.
+- The app displays the reference database grouped by category:
+  - CSV type 1: `Description`
+  - CSV type 2: `Payee` + `Memo`
 - Merge output is downloaded as a new `.xlsx` file, leaving source files unchanged.
