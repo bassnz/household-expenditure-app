@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 from pathlib import Path
 from typing import Optional
@@ -126,6 +127,12 @@ def _parse_dates_to_iso(series: pd.Series) -> pd.Series:
     monthfirst = pd.to_datetime(series, errors="coerce", dayfirst=False)
     merged = dayfirst.fillna(monthfirst)
     return merged.dt.strftime("%Y-%m-%d").fillna("")
+
+
+def _parse_datetime_series(series: pd.Series) -> pd.Series:
+    dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    monthfirst = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    return dayfirst.fillna(monthfirst)
 
 
 def _series_or_blank(df: pd.DataFrame, col: str) -> pd.Series:
@@ -296,35 +303,111 @@ def _coerce_date_columns_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _build_dashboard_frame(history_df: pd.DataFrame, category_col: str, period_mode: str) -> pd.DataFrame:
-    date_col = _first_existing(history_df.columns.tolist(), ["Date of Transaction", "Date Processed", "Date"])
-    if not date_col or "Amount" not in history_df.columns:
+def _update_true_date(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    source_date = pd.Series(pd.NaT, index=out.index, dtype="datetime64[ns]")
+
+    if "Date" in out.columns:
+        parsed_date = _parse_datetime_series(out["Date"])
+        source_date = source_date.fillna(parsed_date)
+
+    if "Date Processed" in out.columns:
+        parsed_processed = _parse_datetime_series(out["Date Processed"])
+        source_date = source_date.fillna(parsed_processed)
+
+    out["True Date"] = source_date
+    return out
+
+
+def _coalesce_dashboard_dates(history_df: pd.DataFrame) -> pd.Series:
+    source_date = pd.Series(pd.NaT, index=history_df.index, dtype="datetime64[ns]")
+    for col in ["True Date", "Date of Transaction", "Date Processed", "Date"]:
+        if col in history_df.columns:
+            source_date = source_date.fillna(_parse_datetime_series(history_df[col]))
+    return source_date
+
+
+def _period_label(dt: pd.Timestamp, period_mode: str) -> str:
+    if period_mode == "Month":
+        return dt.strftime("%Y-%m")
+    if period_mode == "Quarter":
+        quarter = ((dt.month - 1) // 3) + 1
+        return f"{dt.year}-Q{quarter}"
+    return dt.strftime("%Y")
+
+
+def _build_dashboard_frame(history_df: pd.DataFrame, category_col: str, period_mode: str, selected_categories: list[str]) -> pd.DataFrame:
+    if "Amount" not in history_df.columns:
         return pd.DataFrame(columns=["Period", "Category", "Amount"])
 
     work = history_df.copy()
-    dayfirst = pd.to_datetime(work[date_col], errors="coerce", dayfirst=True)
-    monthfirst = pd.to_datetime(work[date_col], errors="coerce", dayfirst=False)
-    work["_date"] = dayfirst.fillna(monthfirst)
+    work["_date"] = _coalesce_dashboard_dates(work)
     work["_amount"] = pd.to_numeric(work["Amount"], errors="coerce")
     work["_category"] = work[category_col].fillna("Uncategorised").astype(str).str.strip()
+    work["_category"] = work["_category"].replace("", "Uncategorised")
     work = work.dropna(subset=["_date", "_amount"])
+    work = work[work["_category"].isin(selected_categories)]
+    if work.empty:
+        return pd.DataFrame(columns=["Period", "Category", "Amount"])
 
-    freq = {"Month": "M", "Quarter": "Q", "Year": "Y"}[period_mode]
-    work["_period"] = work["_date"].dt.to_period(freq).astype(str)
+    if period_mode == "Month":
+        period_start = work["_date"].dt.to_period("M").dt.to_timestamp()
+        period_index = pd.date_range(period_start.min(), period_start.max(), freq="MS")
+    elif period_mode == "Quarter":
+        period_start = work["_date"].dt.to_period("Q").dt.start_time
+        period_index = pd.date_range(period_start.min(), period_start.max(), freq="QS")
+    else:
+        period_start = work["_date"].dt.to_period("Y").dt.start_time
+        period_index = pd.date_range(period_start.min(), period_start.max(), freq="YS")
 
+    period_labels = [_period_label(ts, period_mode) for ts in period_index]
+    work["_period"] = work["_date"].map(lambda d: _period_label(d, period_mode))
     grouped = (
         work.groupby(["_period", "_category"], as_index=False)["_amount"]
         .sum()
         .rename(columns={"_period": "Period", "_category": "Category", "_amount": "Amount"})
     )
-    return grouped.sort_values(["Period", "Category"])
+
+    full_grid = pd.MultiIndex.from_product(
+        [period_labels, selected_categories],
+        names=["Period", "Category"],
+    ).to_frame(index=False)
+
+    merged = full_grid.merge(grouped, on=["Period", "Category"], how="left")
+    merged["Amount"] = merged["Amount"].fillna(0.0)
+    return merged.sort_values(["Period", "Category"])
 
 
 def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
     st.subheader("Spending Dashboard")
     period_mode = st.radio("Time period", options=["Month", "Quarter", "Year"], horizontal=True, key="period_mode")
 
-    dashboard_df = _build_dashboard_frame(history_df, category_col, period_mode)
+    all_categories = (
+        history_df[category_col]
+        .fillna("Uncategorised")
+        .astype(str)
+        .str.strip()
+        .replace("", "Uncategorised")
+        .sort_values()
+        .unique()
+        .tolist()
+    )
+    st.markdown("**Category Filters**")
+    filter_cols = st.columns(4)
+    selected_categories: list[str] = []
+    for idx, category in enumerate(all_categories):
+        key = f"dash_cat_{hashlib.md5(category.encode('utf-8')).hexdigest()[:10]}"
+        col = filter_cols[idx % 4]
+        with col:
+            checked = st.checkbox(category, value=st.session_state.get(key, True), key=key)
+        if checked:
+            selected_categories.append(category)
+
+    if not selected_categories:
+        st.warning("Select at least one category to display the dashboard.")
+        return
+
+    dashboard_df = _build_dashboard_frame(history_df, category_col, period_mode, selected_categories)
     if dashboard_df.empty:
         st.warning("Dashboard could not be generated. Ensure Household_Expenses.xlsx has a date column and Amount.")
         return
@@ -365,7 +448,8 @@ def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.D
 
     all_columns = list(dict.fromkeys(history.columns.tolist() + incoming.columns.tolist()))
     merged = pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
-    return _coerce_date_columns_for_excel(merged)
+    merged = _coerce_date_columns_for_excel(merged)
+    return _update_true_date(merged)
 
 
 def _render_reference_view(reference_df: pd.DataFrame) -> None:
