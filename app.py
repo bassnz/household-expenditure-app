@@ -10,9 +10,6 @@ from zipfile import BadZipFile, ZipFile
 import pandas as pd
 import streamlit as st
 
-from categorizer import build_historical_model, predict_categories
-
-
 TYPE1_HEADERS = [
     "Date Processed",
     "Date of Transaction",
@@ -151,6 +148,12 @@ def _first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
     return None
 
 
+def _normalize_text(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    return " ".join(str(value).strip().lower().split())
+
+
 def _load_reference_db() -> pd.DataFrame:
     if not REFERENCE_DB_PATH.exists():
         return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
@@ -170,6 +173,7 @@ def _save_reference_db(df: pd.DataFrame) -> None:
         if col not in clean.columns:
             clean[col] = pd.NA
     clean = clean[REFERENCE_DB_COLUMNS]
+    clean = clean.sort_values(by=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo"], na_position="last")
     clean.to_csv(REFERENCE_DB_PATH, index=False)
 
 
@@ -225,17 +229,6 @@ def _extract_reference_rows(df: pd.DataFrame, csv_type: str, category_col: str) 
     )
 
 
-def _reference_to_model_df(reference_df: pd.DataFrame) -> pd.DataFrame:
-    if reference_df.empty:
-        return pd.DataFrame(columns=[CATEGORY_COL, "_model_desc", "_model_merchant", "_model_amount"])
-    model_df = pd.DataFrame()
-    model_df[CATEGORY_COL] = reference_df[CATEGORY_COL]
-    model_df["_model_desc"] = reference_df["ModelDesc"]
-    model_df["_model_merchant"] = reference_df["ModelMerchant"]
-    model_df["_model_amount"] = pd.NA
-    return model_df.dropna(subset=[CATEGORY_COL, "_model_desc"])
-
-
 def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -> pd.DataFrame:
     seeds = []
     if "Description" in history_df.columns:
@@ -246,6 +239,61 @@ def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -
         return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
     seed_df = pd.concat(seeds, ignore_index=True) if seeds else pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
     return _dedupe_reference_rows(seed_df)
+
+
+def _majority_category(series: pd.Series) -> str:
+    counts = series.dropna().astype(str).str.strip().value_counts()
+    if counts.empty:
+        return ""
+    return str(counts.index[0])
+
+
+def _build_reference_lookups(reference_df: pd.DataFrame) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
+    type1_map: dict[str, str] = {}
+    type2_map: dict[tuple[str, str], str] = {}
+    if reference_df.empty:
+        return type1_map, type2_map
+
+    type1_df = reference_df[reference_df["CSVType"] == "type1"].copy()
+    if not type1_df.empty:
+        type1_df["_k_desc"] = type1_df["Description"].map(_normalize_text)
+        groups = type1_df[type1_df["_k_desc"] != ""].groupby("_k_desc")[CATEGORY_COL]
+        for key, cats in groups:
+            cat = _majority_category(cats)
+            if cat:
+                type1_map[key] = cat
+
+    type2_df = reference_df[reference_df["CSVType"] == "type2"].copy()
+    if not type2_df.empty:
+        type2_df["_k_payee"] = type2_df["Payee"].map(_normalize_text)
+        type2_df["_k_memo"] = type2_df["Memo"].map(_normalize_text)
+        valid = type2_df[(type2_df["_k_payee"] != "") | (type2_df["_k_memo"] != "")]
+        groups = valid.groupby(["_k_payee", "_k_memo"])[CATEGORY_COL]
+        for key, cats in groups:
+            cat = _majority_category(cats)
+            if cat:
+                type2_map[(key[0], key[1])] = cat
+
+    return type1_map, type2_map
+
+
+def _suggest_categories_from_reference(new_df: pd.DataFrame, csv_type: str, reference_df: pd.DataFrame) -> pd.DataFrame:
+    out = new_df.copy()
+    out["SuggestedCategorisation"] = ""
+    out["MatchStatus"] = "No match"
+
+    type1_map, type2_map = _build_reference_lookups(reference_df)
+    if csv_type == "type1":
+        keys = out["Description"].map(_normalize_text)
+        matched = keys.map(type1_map).fillna("")
+    else:
+        keys = list(zip(out["Payee"].map(_normalize_text), out["Memo"].map(_normalize_text)))
+        matched = pd.Series([type2_map.get(k, "") for k in keys], index=out.index)
+
+    out["SuggestedCategorisation"] = matched
+    out.loc[out["SuggestedCategorisation"] != "", "MatchStatus"] = "Matched reference"
+    out["FinalCategorisation"] = out["SuggestedCategorisation"]
+    return out
 
 
 def _render_reference_view(reference_df: pd.DataFrame) -> None:
@@ -276,56 +324,13 @@ def _render_reference_view(reference_df: pd.DataFrame) -> None:
                 st.dataframe(type2, use_container_width=True, hide_index=True)
 
 
-def _prepare_history_for_model(history_df: pd.DataFrame) -> tuple[pd.DataFrame, str]:
+def _prepare_history(history_df: pd.DataFrame) -> str:
     category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
     if not category_col:
         raise ValueError(
             "Historical workbook needs a category column. Add a 'Categorisation' column with past labels."
         )
-
-    desc_col = _first_existing(history_df.columns.tolist(), ["Description", "Memo", "Reference"])
-    merchant_col = _first_existing(history_df.columns.tolist(), ["Payee", "Description"])
-    amount_col = _first_existing(history_df.columns.tolist(), ["Amount"])
-
-    if not desc_col:
-        raise ValueError("Historical workbook needs at least one description-like column (Description/Memo/Reference).")
-
-    model_df = history_df.copy()
-    model_df["_model_desc"] = model_df[desc_col].fillna("").astype(str)
-
-    if "Reference" in model_df.columns and desc_col != "Reference":
-        model_df["_model_desc"] = (
-            model_df["_model_desc"] + " " + model_df["Reference"].fillna("").astype(str)
-        ).str.strip()
-
-    if merchant_col:
-        model_df["_model_merchant"] = model_df[merchant_col]
-    else:
-        model_df["_model_merchant"] = ""
-
-    if amount_col:
-        model_df["_model_amount"] = model_df[amount_col]
-    else:
-        model_df["_model_amount"] = pd.NA
-
-    return model_df, category_col
-
-
-def _prepare_new_for_model(new_df: pd.DataFrame, csv_type: str) -> pd.DataFrame:
-    work = new_df.copy()
-    if csv_type == "type1":
-        work["_model_desc"] = (
-            work["Description"].fillna("").astype(str) + " " + work["Reference"].fillna("").astype(str)
-        ).str.strip()
-        work["_model_merchant"] = work["Description"]
-    else:
-        work["_model_desc"] = (
-            work["Payee"].fillna("").astype(str) + " " + work["Memo"].fillna("").astype(str)
-        ).str.strip()
-        work["_model_merchant"] = work["Payee"]
-
-    work["_model_amount"] = work["Amount"]
-    return work
+    return category_col
 
 
 def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
@@ -334,8 +339,8 @@ def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.D
         history[CATEGORY_COL] = pd.NA
 
     incoming = edited_df.copy()
-    incoming[CATEGORY_COL] = incoming["PredictedCategory"]
-    incoming = incoming.drop(columns=["PredictedCategory", "PredictionReason"], errors="ignore")
+    incoming[CATEGORY_COL] = incoming["FinalCategorisation"]
+    incoming = incoming.drop(columns=["SuggestedCategorisation", "FinalCategorisation", "MatchStatus"], errors="ignore")
 
     all_columns = list(dict.fromkeys(history.columns.tolist() + incoming.columns.tolist()))
     return pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
@@ -362,7 +367,7 @@ st.subheader("2) Auto-Categorization")
 st.caption(f"Detected CSV format: {csv_type}")
 
 try:
-    history_model_df, history_category_col = _prepare_history_for_model(history_df)
+    history_category_col = _prepare_history(history_df)
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -390,31 +395,11 @@ _render_reference_view(reference_df)
 
 if st.button("Run Auto-Categorization", type="primary"):
     try:
-        ref_model_df = _reference_to_model_df(reference_df)
-        if history_category_col != CATEGORY_COL and CATEGORY_COL in ref_model_df.columns:
-            ref_model_df[history_category_col] = ref_model_df[CATEGORY_COL]
-        training_df = pd.concat([history_model_df, ref_model_df], ignore_index=True, sort=False)
-        new_model_df = _prepare_new_for_model(new_df, csv_type)
-
-        model = build_historical_model(
-            history_df=training_df,
-            description_col="_model_desc",
-            merchant_col="_model_merchant",
-            amount_col="_model_amount",
-            category_col=history_category_col,
-        )
-        predicted_df, predicted_categories = predict_categories(
-            new_df=new_model_df,
-            model=model,
-            description_col="_model_desc",
-            merchant_col="_model_merchant",
-            amount_col="_model_amount",
-        )
+        predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
     except ValueError as exc:
         st.error(str(exc))
     else:
         st.session_state["predicted_df"] = predicted_df
-        st.session_state["predicted_categories"] = predicted_categories
         st.session_state["csv_type"] = csv_type
 
 if "predicted_df" not in st.session_state:
@@ -424,33 +409,38 @@ st.subheader("3) Review and Approve")
 st.write("Edit any category before approval.")
 
 predicted_df = st.session_state["predicted_df"].copy()
-categories = st.session_state["predicted_categories"]
+review_df = predicted_df.copy()
 
-# Hide model helper columns from review grid.
-review_df = predicted_df.drop(columns=["_model_desc", "_model_merchant", "_model_amount"], errors="ignore")
-
-current_values = sorted({str(v) for v in review_df["PredictedCategory"].dropna().astype(str)})
-category_options = sorted(set(categories + current_values))
+match_count = int((review_df["SuggestedCategorisation"].astype(str).str.strip() != "").sum())
+st.caption(f"Matched from reference: {match_count} of {len(review_df)} transactions")
 
 edited_df = st.data_editor(
     review_df,
     use_container_width=True,
     num_rows="fixed",
     column_config={
-        "PredictedCategory": st.column_config.SelectboxColumn(
-            "PredictedCategory",
-            options=category_options,
-            required=True,
+        "SuggestedCategorisation": st.column_config.TextColumn(
+            "SuggestedCategorisation",
+            disabled=True,
+        ),
+        "FinalCategorisation": st.column_config.TextColumn(
+            "FinalCategorisation",
+            help="Enter a category manually when no reference match is found.",
         )
     },
 )
 
 approve = st.checkbox("I approve these categories and want to merge into the master workbook")
 if approve and st.button("Merge into Master Workbook", type="primary"):
+    missing_final = edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == ""
+    if bool(missing_final.any()):
+        st.error("Some transactions still have blank FinalCategorisation. Please complete them before merging.")
+        st.stop()
+
     merged = _merge_for_export(history_df, edited_df)
     csv_type_for_save = st.session_state.get("csv_type", csv_type)
 
-    new_refs = _extract_reference_rows(edited_df, csv_type_for_save, "PredictedCategory")
+    new_refs = _extract_reference_rows(edited_df, csv_type_for_save, "FinalCategorisation")
     all_refs = _dedupe_reference_rows(pd.concat([reference_df, new_refs], ignore_index=True))
     ref_save_error = None
     try:
