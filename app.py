@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import csv
-import importlib.util
 import io
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from zipfile import BadZipFile, ZipFile
 
 import pandas as pd
 import streamlit as st
+
 
 TYPE1_HEADERS = [
     "Date Processed",
@@ -32,23 +31,12 @@ TYPE2_HEADERS = [
 ]
 
 CATEGORY_COL = "Categorisation"
-REFERENCE_DB_PATH = Path("categorisation_reference.csv")
-REFERENCE_DB_COLUMNS = [
-    CATEGORY_COL,
-    "CSVType",
-    "Description",
-    "Payee",
-    "Memo",
-    "ModelDesc",
-    "ModelMerchant",
-    "LastUpdated",
-]
-REFERENCE_DB_DEDUPE_KEYS = [CATEGORY_COL, "CSVType", "Description", "Payee", "Memo", "ModelDesc", "ModelMerchant"]
+MAIN_WORKBOOK_PATH = Path("Household_Expenses.xlsx")
 
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
 st.title("Transaction Categorizer")
-st.caption("Upload historical .xlsx data + a new .csv file, review predicted categories, approve, then merge.")
+st.caption("Upload a new .csv file. Suggestions are generated from Household_Expenses.xlsx.")
 
 
 def _read_text_bytes(raw_bytes: bytes) -> str:
@@ -68,9 +56,7 @@ def _detect_csv_header_row(raw_text: str) -> tuple[int, str]:
             return idx, "type1"
         if clean == TYPE2_HEADERS:
             return idx, "type2"
-    raise ValueError(
-        "CSV headers not recognized. Expected one of the two supported bank formats."
-    )
+    raise ValueError("CSV headers not recognized. Expected one of the two supported bank formats.")
 
 
 def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
@@ -81,79 +67,44 @@ def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
     raw_text = _read_text_bytes(raw_bytes)
     header_row_idx, csv_type = _detect_csv_header_row(raw_text)
 
-    df = pd.read_csv(
-        io.StringIO(raw_text),
-        skiprows=header_row_idx,
-        engine="python",
-        on_bad_lines="skip",
-    )
-
+    df = pd.read_csv(io.StringIO(raw_text), skiprows=header_row_idx, engine="python", on_bad_lines="skip")
     expected = TYPE1_HEADERS if csv_type == "type1" else TYPE2_HEADERS
     missing = [c for c in expected if c not in df.columns]
     if missing:
         raise ValueError(f"CSV is missing required columns: {missing}")
-
-    # Keep only known columns for that native format.
-    df = df[expected].copy()
-    return df, csv_type
+    return df[expected].copy(), csv_type
 
 
-def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
-    raw_bytes = uploaded_file.getvalue()
+def _load_main_workbook(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        raise ValueError(
+            f"Main workbook not found: {path}. Add Household_Expenses.xlsx to the repository root."
+        )
+
+    raw_bytes = path.read_bytes()
     if not raw_bytes:
-        st.error("The uploaded workbook is empty. Upload a non-empty .xlsx file.")
-        st.stop()
+        raise ValueError("Main workbook is empty.")
 
     try:
         with ZipFile(io.BytesIO(raw_bytes)) as zf:
             names = set(zf.namelist())
-    except BadZipFile:
-        st.error(
-            "This file is not a valid .xlsx workbook package. "
-            "Please open it and re-save as Excel Workbook (.xlsx), then upload again."
-        )
-        st.stop()
+    except BadZipFile as exc:
+        raise ValueError("Main workbook is not a valid .xlsx file.") from exc
 
     required_entries = {"[Content_Types].xml", "xl/workbook.xml"}
     if not required_entries.issubset(names):
-        st.error(
-            "The uploaded file is missing required .xlsx workbook parts. "
-            "Please re-save it as a standard .xlsx file and try again."
-        )
-        st.stop()
+        raise ValueError("Main workbook is missing required .xlsx workbook parts.")
 
-    openpyxl_exc = None
     try:
         return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
     except Exception as exc:  # noqa: BLE001
-        openpyxl_exc = exc
-
-    calamine_available = importlib.util.find_spec("python_calamine") is not None
-    if calamine_available:
-        try:
-            return pd.read_excel(io.BytesIO(raw_bytes), engine="calamine")
-        except Exception as calamine_exc:  # noqa: BLE001
-            st.error(
-                "Could not read the historical workbook with either parser. "
-                "Please re-save it as a standard .xlsx workbook and try again."
-            )
-            st.caption(f"openpyxl detail: {openpyxl_exc}")
-            st.caption(f"calamine detail: {calamine_exc}")
-            st.stop()
-    else:
-        st.error(
-            "Could not read the historical workbook with openpyxl. "
-            "Please re-save it as a standard .xlsx workbook and try again."
-        )
-        st.caption(f"openpyxl detail: {openpyxl_exc}")
-        st.caption("calamine fallback is not installed in this runtime.")
-        st.stop()
+        raise ValueError(f"Could not read main workbook: {exc}") from exc
 
 
 def _first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
     lookup = {c.lower(): c for c in cols}
-    for c in candidates:
-        found = lookup.get(c.lower())
+    for candidate in candidates:
+        found = lookup.get(candidate.lower())
         if found:
             return found
     return None
@@ -165,105 +116,131 @@ def _normalize_text(value: object) -> str:
     return " ".join(str(value).strip().lower().split())
 
 
-def _load_reference_db() -> pd.DataFrame:
-    if not REFERENCE_DB_PATH.exists():
-        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    try:
-        df = pd.read_csv(REFERENCE_DB_PATH)
-    except Exception:  # noqa: BLE001
-        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    for col in REFERENCE_DB_COLUMNS:
-        if col not in df.columns:
-            df[col] = pd.NA
-    return df[REFERENCE_DB_COLUMNS].copy()
+def _normalized_unique_id(series: pd.Series) -> pd.Series:
+    return series.fillna("").astype(str).str.strip().str.lower()
 
 
-def _save_reference_db(df: pd.DataFrame) -> None:
-    clean = df.copy()
-    for col in REFERENCE_DB_COLUMNS:
-        if col not in clean.columns:
-            clean[col] = pd.NA
-    clean = clean[REFERENCE_DB_COLUMNS]
-    clean = clean.sort_values(by=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo"], na_position="last")
-    clean.to_csv(REFERENCE_DB_PATH, index=False)
+def _parse_dates_to_iso(series: pd.Series) -> pd.Series:
+    dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    monthfirst = pd.to_datetime(series, errors="coerce", dayfirst=False)
+    merged = dayfirst.fillna(monthfirst)
+    return merged.dt.strftime("%Y-%m-%d").fillna("")
 
 
-def _dedupe_reference_rows(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    out = df.copy()
-    for col in REFERENCE_DB_COLUMNS:
-        if col not in out.columns:
-            out[col] = pd.NA
-    out = out[REFERENCE_DB_COLUMNS]
-    return out.drop_duplicates(subset=REFERENCE_DB_DEDUPE_KEYS, keep="last")
+def _series_or_blank(df: pd.DataFrame, col: str) -> pd.Series:
+    if col in df.columns:
+        return df[col]
+    return pd.Series("", index=df.index, dtype="object")
+
+
+def _build_duplicate_key(df: pd.DataFrame) -> pd.Series:
+    date_source = _series_or_blank(df, "Date of Transaction")
+    if "Date Processed" in df.columns:
+        date_source = date_source.where(date_source.notna() & (date_source.astype(str).str.strip() != ""), df["Date Processed"])
+    if "Date" in df.columns:
+        date_source = date_source.where(date_source.notna() & (date_source.astype(str).str.strip() != ""), df["Date"])
+
+    date_key = _parse_dates_to_iso(date_source)
+    amount_key = (
+        pd.to_numeric(_series_or_blank(df, "Amount"), errors="coerce")
+        .round(2)
+        .map(lambda v: f"{v:.2f}" if pd.notna(v) else "")
+    )
+    tran_key = _series_or_blank(df, "Tran Type").map(_normalize_text)
+    desc_key = _series_or_blank(df, "Description").map(_normalize_text)
+    ref_key = _series_or_blank(df, "Reference").map(_normalize_text)
+    payee_key = _series_or_blank(df, "Payee").map(_normalize_text)
+    memo_key = _series_or_blank(df, "Memo").map(_normalize_text)
+
+    return (
+        date_key
+        + "|"
+        + amount_key
+        + "|"
+        + tran_key
+        + "|"
+        + desc_key
+        + "|"
+        + ref_key
+        + "|"
+        + payee_key
+        + "|"
+        + memo_key
+    )
+
+
+def _annotate_duplicates(new_df: pd.DataFrame, history_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    annotated = new_df.copy()
+    reasons = pd.Series("", index=annotated.index, dtype="object")
+
+    new_uid = _normalized_unique_id(_series_or_blank(annotated, "Unique Id"))
+    hist_uid = _normalized_unique_id(_series_or_blank(history_df, "Unique Id"))
+    hist_uid_set = set(hist_uid[hist_uid != ""])
+
+    dup_within_new_uid = (new_uid != "") & new_uid.duplicated(keep=False)
+    dup_against_hist_uid = (new_uid != "") & new_uid.isin(hist_uid_set)
+
+    new_key = _build_duplicate_key(annotated)
+    hist_key = _build_duplicate_key(history_df)
+    hist_key_set = set(hist_key[hist_key != "||||||"])
+    dup_within_new_key = (new_key != "||||||") & new_key.duplicated(keep=False)
+    dup_against_hist_key = (new_key != "||||||") & new_key.isin(hist_key_set)
+
+    reasons = reasons.mask(dup_within_new_uid, "Duplicate Unique Id within uploaded CSV")
+    reasons = reasons.mask(dup_against_hist_uid, "Unique Id already exists in Household_Expenses.xlsx")
+    reasons = reasons.mask((reasons == "") & dup_within_new_key, "Possible duplicate transaction within uploaded CSV")
+    reasons = reasons.mask((reasons == "") & dup_against_hist_key, "Possible duplicate transaction already in Household_Expenses.xlsx")
+
+    annotated["DuplicateFlag"] = reasons != ""
+    annotated["DuplicateReason"] = reasons
+
+    report_cols = [c for c in ["Unique Id", "Date Processed", "Date of Transaction", "Date", "Description", "Payee", "Memo", "Amount"] if c in annotated.columns]
+    report = annotated[annotated["DuplicateFlag"]][report_cols + ["DuplicateReason"]].copy()
+    return annotated, report
 
 
 def _extract_reference_rows(df: pd.DataFrame, csv_type: str, category_col: str) -> pd.DataFrame:
     if category_col not in df.columns:
-        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
+        return pd.DataFrame(columns=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo"])
 
-    out = pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    out[CATEGORY_COL] = df[category_col]
+    out = pd.DataFrame()
+    out[CATEGORY_COL] = df[category_col].astype(str).str.strip()
     out["CSVType"] = csv_type
-    out["LastUpdated"] = datetime.now().isoformat(timespec="seconds")
 
     if csv_type == "type1":
         out["Description"] = df.get("Description", pd.Series(dtype="object"))
-        model_desc = (
-            df.get("Description", pd.Series(dtype="object")).fillna("").astype(str)
-            + " "
-            + df.get("Reference", pd.Series(dtype="object")).fillna("").astype(str)
-        ).str.strip()
-        out["ModelDesc"] = model_desc
-        out["ModelMerchant"] = df.get("Description", pd.Series(dtype="object"))
         out["Payee"] = pd.NA
         out["Memo"] = pd.NA
     else:
+        out["Description"] = pd.NA
         out["Payee"] = df.get("Payee", pd.Series(dtype="object"))
         out["Memo"] = df.get("Memo", pd.Series(dtype="object"))
-        model_desc = (
-            df.get("Payee", pd.Series(dtype="object")).fillna("").astype(str)
-            + " "
-            + df.get("Memo", pd.Series(dtype="object")).fillna("").astype(str)
-        ).str.strip()
-        out["ModelDesc"] = model_desc
-        out["ModelMerchant"] = df.get("Payee", pd.Series(dtype="object"))
-        out["Description"] = pd.NA
 
-    out[CATEGORY_COL] = out[CATEGORY_COL].astype(str).str.strip()
-    out["ModelDesc"] = out["ModelDesc"].astype(str).str.strip()
-    out = out[(out[CATEGORY_COL] != "") & (out["ModelDesc"] != "")]
-    out = out[REFERENCE_DB_COLUMNS]
-    return out.drop_duplicates(
-        subset=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo", "ModelDesc", "ModelMerchant"]
-    )
+    out = out[(out[CATEGORY_COL] != "") & out[CATEGORY_COL].notna()]
+    return out.drop_duplicates()
 
 
 def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -> pd.DataFrame:
-    seeds = []
+    rows = []
     if "Description" in history_df.columns:
-        seeds.append(_extract_reference_rows(history_df, "type1", category_col))
+        rows.append(_extract_reference_rows(history_df, "type1", category_col))
     if {"Payee", "Memo"}.issubset(history_df.columns):
-        seeds.append(_extract_reference_rows(history_df, "type2", category_col))
-    if not seeds:
-        return pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    seed_df = pd.concat(seeds, ignore_index=True) if seeds else pd.DataFrame(columns=REFERENCE_DB_COLUMNS)
-    return _dedupe_reference_rows(seed_df)
+        rows.append(_extract_reference_rows(history_df, "type2", category_col))
+    if not rows:
+        return pd.DataFrame(columns=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo"])
+    out = pd.concat(rows, ignore_index=True)
+    out = out.drop_duplicates(subset=[CATEGORY_COL, "CSVType", "Description", "Payee", "Memo"], keep="last")
+    return out
 
 
 def _majority_category(series: pd.Series) -> str:
     counts = series.dropna().astype(str).str.strip().value_counts()
-    if counts.empty:
-        return ""
-    return str(counts.index[0])
+    return "" if counts.empty else str(counts.index[0])
 
 
 def _build_reference_lookups(reference_df: pd.DataFrame) -> tuple[dict[str, str], dict[tuple[str, str], str]]:
     type1_map: dict[str, str] = {}
     type2_map: dict[tuple[str, str], str] = {}
-    if reference_df.empty:
-        return type1_map, type2_map
 
     type1_df = reference_df[reference_df["CSVType"] == "type1"].copy()
     if not type1_df.empty:
@@ -307,52 +284,13 @@ def _suggest_categories_from_reference(new_df: pd.DataFrame, csv_type: str, refe
     return out
 
 
-def _render_reference_view(reference_df: pd.DataFrame) -> None:
-    st.subheader("Reference Database")
-    st.caption("Mappings used to improve category learning.")
-    if reference_df.empty:
-        st.info("No reference rows saved yet. Approve a categorized CSV to populate the database.")
-        return
-
-    st.write(f"Stored mappings: {len(reference_df)}")
-    csv_data = reference_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="Download reference DB",
-        data=csv_data,
-        file_name="categorisation_reference.csv",
-        mime="text/csv",
-    )
-    for category in sorted(reference_df[CATEGORY_COL].dropna().astype(str).unique()):
-        cat_df = reference_df[reference_df[CATEGORY_COL].astype(str) == category]
-        with st.expander(f"{category} ({len(cat_df)} mappings)", expanded=False):
-            type1 = cat_df[cat_df["CSVType"] == "type1"][["Description"]].dropna().drop_duplicates()
-            if not type1.empty:
-                st.markdown("**CSV Type 1 - Description**")
-                st.dataframe(type1, use_container_width=True, hide_index=True)
-            type2 = cat_df[cat_df["CSVType"] == "type2"][["Payee", "Memo"]].dropna(how="all").drop_duplicates()
-            if not type2.empty:
-                st.markdown("**CSV Type 2 - Payee + Memo**")
-                st.dataframe(type2, use_container_width=True, hide_index=True)
-
-
-def _prepare_history(history_df: pd.DataFrame) -> str:
-    category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
-    if not category_col:
-        raise ValueError(
-            "Historical workbook needs a category column. Add a 'Categorisation' column with past labels."
-        )
-    return category_col
-
-
 def _coerce_date_columns_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    date_columns = ["Date", "Date Processed", "Date of Transaction"]
-    for col in date_columns:
+    for col in ["Date", "Date Processed", "Date of Transaction"]:
         if col not in out.columns:
             continue
-        series = out[col]
-        parsed_dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
-        parsed_monthfirst = pd.to_datetime(series, errors="coerce", dayfirst=False)
+        parsed_dayfirst = pd.to_datetime(out[col], errors="coerce", dayfirst=True)
+        parsed_monthfirst = pd.to_datetime(out[col], errors="coerce", dayfirst=False)
         out[col] = parsed_dayfirst.fillna(parsed_monthfirst)
     return out
 
@@ -363,24 +301,57 @@ def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.D
         history[CATEGORY_COL] = pd.NA
 
     incoming = edited_df.copy()
+    incoming = incoming[~incoming["DuplicateFlag"].fillna(False)].copy()
     incoming[CATEGORY_COL] = incoming["FinalCategorisation"]
-    incoming = incoming.drop(columns=["SuggestedCategorisation", "FinalCategorisation", "MatchStatus"], errors="ignore")
+    incoming = incoming.drop(
+        columns=["SuggestedCategorisation", "FinalCategorisation", "MatchStatus", "DuplicateFlag", "DuplicateReason"],
+        errors="ignore",
+    )
 
     all_columns = list(dict.fromkeys(history.columns.tolist() + incoming.columns.tolist()))
     merged = pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
     return _coerce_date_columns_for_excel(merged)
 
 
+def _render_reference_view(reference_df: pd.DataFrame) -> None:
+    st.subheader("Reference Set (from Household_Expenses.xlsx)")
+    if reference_df.empty:
+        st.info("No reference rows found in Household_Expenses.xlsx yet.")
+        return
+
+    st.write(f"Reference rows: {len(reference_df)}")
+    for category in sorted(reference_df[CATEGORY_COL].dropna().astype(str).unique()):
+        cat_df = reference_df[reference_df[CATEGORY_COL].astype(str) == category]
+        with st.expander(f"{category} ({len(cat_df)} rows)", expanded=False):
+            type1 = cat_df[cat_df["CSVType"] == "type1"][["Description"]].dropna().drop_duplicates()
+            if not type1.empty:
+                st.markdown("**CSV Type 1 - Description**")
+                st.dataframe(type1, use_container_width=True, hide_index=True)
+            type2 = cat_df[cat_df["CSVType"] == "type2"][["Payee", "Memo"]].dropna(how="all").drop_duplicates()
+            if not type2.empty:
+                st.markdown("**CSV Type 2 - Payee + Memo**")
+                st.dataframe(type2, use_container_width=True, hide_index=True)
+
+
 with st.sidebar:
-    st.header("1) Upload Files")
-    history_file = st.file_uploader("Historical workbook (.xlsx)", type=["xlsx"], key="history")
+    st.header("1) Upload New CSV")
     new_csv_file = st.file_uploader("New transactions (.csv)", type=["csv"], key="csv")
 
-if not history_file or not new_csv_file:
-    st.info("Upload both files to continue.")
+if not new_csv_file:
+    st.info("Upload a CSV to continue.")
     st.stop()
 
-history_df = _load_history_xlsx(history_file)
+try:
+    history_df = _load_main_workbook(MAIN_WORKBOOK_PATH)
+except ValueError as exc:
+    st.error(str(exc))
+    st.caption("Tip: Commit a workbook named Household_Expenses.xlsx at the repo root.")
+    st.stop()
+
+history_category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
+if not history_category_col:
+    st.error("Household_Expenses.xlsx must contain a category column (Categorisation or Category).")
+    st.stop()
 
 try:
     new_df, csv_type = _load_supported_csv(new_csv_file)
@@ -388,107 +359,65 @@ except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
+new_df, duplicate_report = _annotate_duplicates(new_df, history_df)
+
 st.subheader("2) Auto-Categorization")
 st.caption(f"Detected CSV format: {csv_type}")
+if not duplicate_report.empty:
+    st.warning(f"Duplicate transactions detected: {len(duplicate_report)}. They will be excluded from merge.")
+    st.dataframe(duplicate_report, use_container_width=True, hide_index=True)
+else:
+    st.caption("No duplicates detected in uploaded transactions.")
 
-try:
-    history_category_col = _prepare_history(history_df)
-except ValueError as exc:
-    st.error(str(exc))
-    st.stop()
-
-# Source-of-truth reference rows come from the historical workbook.
-history_reference_df = _build_reference_from_history(history_df, history_category_col)
-repo_reference_df = _load_reference_db()
-reference_df = _dedupe_reference_rows(pd.concat([repo_reference_df, history_reference_df], ignore_index=True))
-
-# Ensure the repository reference file exists and stays in sync with history-derived mappings.
-reference_sync_error = None
-reference_needs_write = (not REFERENCE_DB_PATH.exists()) or (len(reference_df) != len(repo_reference_df))
-if reference_needs_write:
-    try:
-        _save_reference_db(reference_df)
-    except Exception as exc:  # noqa: BLE001
-        reference_sync_error = exc
-
-st.caption("Categorisations in the uploaded .xlsx are treated as the initial source of truth.")
-if reference_sync_error:
-    st.warning("Reference DB could not be written in this runtime. Use the download button to persist it to your repo.")
-    st.caption(f"Save detail: {reference_sync_error}")
-
+reference_df = _build_reference_from_history(history_df, history_category_col)
 _render_reference_view(reference_df)
 
 if st.button("Run Auto-Categorization", type="primary"):
-    try:
-        predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
-    except ValueError as exc:
-        st.error(str(exc))
-    else:
-        st.session_state["predicted_df"] = predicted_df
-        st.session_state["csv_type"] = csv_type
+    predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
+    st.session_state["predicted_df"] = predicted_df
 
 if "predicted_df" not in st.session_state:
     st.stop()
 
 st.subheader("3) Review and Approve")
-st.write("Edit any category before approval.")
-
 predicted_df = st.session_state["predicted_df"].copy()
-review_df = predicted_df.copy()
-
-match_count = int((review_df["SuggestedCategorisation"].astype(str).str.strip() != "").sum())
-st.caption(f"Matched from reference: {match_count} of {len(review_df)} transactions")
+match_count = int((predicted_df["SuggestedCategorisation"].astype(str).str.strip() != "").sum())
+st.caption(f"Matched from Household_Expenses.xlsx: {match_count} of {len(predicted_df)} transactions")
 
 edited_df = st.data_editor(
-    review_df,
+    predicted_df,
     use_container_width=True,
     num_rows="fixed",
     column_config={
-        "SuggestedCategorisation": st.column_config.TextColumn(
-            "SuggestedCategorisation",
-            disabled=True,
-        ),
+        "SuggestedCategorisation": st.column_config.TextColumn("SuggestedCategorisation", disabled=True),
         "FinalCategorisation": st.column_config.TextColumn(
             "FinalCategorisation",
-            help="Enter a category manually when no reference match is found.",
-        )
+            help="Enter manually when no suggestion is provided.",
+        ),
+        "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
+        "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
     },
 )
 
-approve = st.checkbox("I approve these categories and want to merge into the master workbook")
-if approve and st.button("Merge into Master Workbook", type="primary"):
-    missing_final = edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == ""
-    if bool(missing_final.any()):
-        st.error("Some transactions still have blank FinalCategorisation. Please complete them before merging.")
+approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
+if approve and st.button("Merge and Download Updated Workbook", type="primary"):
+    missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
+    if bool(missing.any()):
+        st.error("Some non-duplicate transactions still have blank FinalCategorisation. Please complete them before merging.")
         st.stop()
 
     merged = _merge_for_export(history_df, edited_df)
-    csv_type_for_save = st.session_state.get("csv_type", csv_type)
-
-    new_refs = _extract_reference_rows(edited_df, csv_type_for_save, "FinalCategorisation")
-    all_refs = _dedupe_reference_rows(pd.concat([reference_df, new_refs], ignore_index=True))
-    ref_save_error = None
-    try:
-        _save_reference_db(all_refs)
-    except Exception as exc:  # noqa: BLE001
-        ref_save_error = exc
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         merged.to_excel(writer, index=False, sheet_name="Master")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    file_name = f"master_merged_{timestamp}.xlsx"
+    file_name = "Household_Expenses.xlsx"
 
-    st.success("Approved and merged. Download the updated master workbook.")
+    st.success("Merged successfully. Download the updated workbook.")
     st.download_button(
-        label="Download merged workbook",
+        label="Download updated workbook",
         data=output.getvalue(),
         file_name=file_name,
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-    if ref_save_error:
-        st.warning("Merged workbook succeeded, but reference database could not be saved on this runtime.")
-        st.caption(f"Save detail: {ref_save_error}")
-    else:
-        st.success(f"Reference database updated: {REFERENCE_DB_PATH}")
