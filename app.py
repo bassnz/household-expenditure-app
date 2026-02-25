@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import re
 from pathlib import Path
 from typing import Optional
 from zipfile import BadZipFile, ZipFile
@@ -35,6 +36,26 @@ TYPE2_HEADERS = [
 CATEGORY_COL = "Categorisation"
 MAIN_WORKBOOK_PATH = Path("Household_Expenses.xlsx")
 LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa"}
+KEYWORD_SHEET_NAME = "KeywordRules"
+KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
+STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "from",
+    "with",
+    "to",
+    "eftpos",
+    "payment",
+    "bill",
+    "pmt",
+    "transfer",
+    "card",
+    "d",
+    "dd",
+    "ap",
+    "of",
+}
 
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
@@ -78,7 +99,7 @@ def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
     return df[expected].copy(), csv_type
 
 
-def _load_main_workbook(path: Path) -> pd.DataFrame:
+def _load_main_workbook(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not path.exists():
         raise ValueError(
             f"Main workbook not found: {path}. Add Household_Expenses.xlsx to the repository root."
@@ -99,7 +120,19 @@ def _load_main_workbook(path: Path) -> pd.DataFrame:
         raise ValueError("Main workbook is missing required .xlsx workbook parts.")
 
     try:
-        return pd.read_excel(io.BytesIO(raw_bytes), engine="openpyxl")
+        excel = pd.ExcelFile(io.BytesIO(raw_bytes), engine="openpyxl")
+        sheet_names = excel.sheet_names
+        master_sheet = "Master" if "Master" in sheet_names else sheet_names[0]
+        history_df = pd.read_excel(excel, sheet_name=master_sheet)
+        if KEYWORD_SHEET_NAME in sheet_names:
+            keyword_df = pd.read_excel(excel, sheet_name=KEYWORD_SHEET_NAME)
+        else:
+            keyword_df = pd.DataFrame(columns=KEYWORD_RULE_COLUMNS)
+        for col in KEYWORD_RULE_COLUMNS:
+            if col not in keyword_df.columns:
+                keyword_df[col] = pd.NA
+        keyword_df = keyword_df[KEYWORD_RULE_COLUMNS]
+        return history_df, keyword_df
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Could not read main workbook: {exc}") from exc
 
@@ -117,6 +150,11 @@ def _normalize_text(value: object) -> str:
     if pd.isna(value):
         return ""
     return " ".join(str(value).strip().lower().split())
+
+
+def _tokenize_keywords(text: str) -> list[str]:
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    return [t for t in tokens if len(t) >= 3 and not t.isdigit() and t not in STOPWORDS]
 
 
 def _normalized_unique_id(series: pd.Series) -> pd.Series:
@@ -242,6 +280,58 @@ def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -
     return out
 
 
+def _build_keyword_rules_from_history(history_df: pd.DataFrame, category_col: str) -> pd.DataFrame:
+    text_cols = [c for c in ["Description", "Payee", "Memo", "Reference"] if c in history_df.columns]
+    if not text_cols:
+        return pd.DataFrame(columns=KEYWORD_RULE_COLUMNS)
+
+    base = history_df[[category_col] + text_cols].copy()
+    base[category_col] = base[category_col].fillna("").astype(str).str.strip()
+    base = base[base[category_col] != ""]
+    if base.empty:
+        return pd.DataFrame(columns=KEYWORD_RULE_COLUMNS)
+
+    token_records: list[tuple[str, str]] = []
+    for _, row in base.iterrows():
+        category = str(row[category_col]).strip()
+        text = " ".join(str(row[col]) for col in text_cols if pd.notna(row[col]))
+        for token in set(_tokenize_keywords(text)):
+            token_records.append((token, category))
+
+    if not token_records:
+        return pd.DataFrame(columns=KEYWORD_RULE_COLUMNS)
+
+    token_df = pd.DataFrame(token_records, columns=["Keyword", CATEGORY_COL])
+    counts = token_df.groupby(["Keyword", CATEGORY_COL], as_index=False).size().rename(columns={"size": "MatchCount"})
+    totals = counts.groupby("Keyword", as_index=False)["MatchCount"].sum().rename(columns={"MatchCount": "TotalCount"})
+    merged = counts.merge(totals, on="Keyword", how="left")
+    merged["Confidence"] = merged["MatchCount"] / merged["TotalCount"]
+
+    # Keep only recurring terms with a dominant category mapping.
+    merged = merged[(merged["TotalCount"] >= 2) & (merged["MatchCount"] >= 2) & (merged["Confidence"] >= 0.6)]
+    merged = merged.sort_values(["Keyword", "Confidence", "MatchCount"], ascending=[True, False, False])
+    rules = merged.drop_duplicates(subset=["Keyword"], keep="first").copy()
+    rules["LastUpdated"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    rules = rules[KEYWORD_RULE_COLUMNS]
+    return rules.sort_values(["Keyword"])
+
+
+def _merge_keyword_rules(existing_rules: pd.DataFrame, derived_rules: pd.DataFrame) -> pd.DataFrame:
+    out = pd.concat([existing_rules, derived_rules], ignore_index=True)
+    for col in KEYWORD_RULE_COLUMNS:
+        if col not in out.columns:
+            out[col] = pd.NA
+    out = out[KEYWORD_RULE_COLUMNS]
+    out["Keyword"] = out["Keyword"].fillna("").astype(str).str.strip().str.lower()
+    out[CATEGORY_COL] = out[CATEGORY_COL].fillna("").astype(str).str.strip()
+    out["MatchCount"] = pd.to_numeric(out["MatchCount"], errors="coerce").fillna(0).astype(int)
+    out["TotalCount"] = pd.to_numeric(out["TotalCount"], errors="coerce").fillna(0).astype(int)
+    out["Confidence"] = pd.to_numeric(out["Confidence"], errors="coerce").fillna(0.0)
+    out = out[(out["Keyword"] != "") & (out[CATEGORY_COL] != "")]
+    out = out.sort_values(["Keyword", "Confidence", "MatchCount"], ascending=[True, False, False])
+    return out.drop_duplicates(subset=["Keyword"], keep="first")
+
+
 def _majority_category(series: pd.Series) -> str:
     counts = series.dropna().astype(str).str.strip().value_counts()
     return "" if counts.empty else str(counts.index[0])
@@ -290,6 +380,53 @@ def _suggest_categories_from_reference(new_df: pd.DataFrame, csv_type: str, refe
     out["SuggestedCategorisation"] = matched
     out.loc[out["SuggestedCategorisation"] != "", "MatchStatus"] = "Matched reference"
     out["FinalCategorisation"] = out["SuggestedCategorisation"]
+    return out
+
+
+def _add_secondary_keyword_suggestions(
+    df: pd.DataFrame, csv_type: str, keyword_rules: pd.DataFrame
+) -> pd.DataFrame:
+    out = df.copy()
+    out["SecondarySuggestedCategorisation"] = ""
+    out["SecondaryKeywords"] = ""
+    out["SecondaryScore"] = 0
+    if keyword_rules.empty:
+        return out
+
+    keyword_to_category = dict(zip(keyword_rules["Keyword"], keyword_rules[CATEGORY_COL]))
+    keyword_to_weight = dict(zip(keyword_rules["Keyword"], keyword_rules["Confidence"]))
+
+    if csv_type == "type1":
+        text_series = (
+            _series_or_blank(out, "Description").fillna("").astype(str)
+            + " "
+            + _series_or_blank(out, "Reference").fillna("").astype(str)
+        )
+    else:
+        text_series = (
+            _series_or_blank(out, "Payee").fillna("").astype(str)
+            + " "
+            + _series_or_blank(out, "Memo").fillna("").astype(str)
+        )
+
+    for idx, text in text_series.items():
+        tokens = set(_tokenize_keywords(str(text)))
+        scores: dict[str, float] = {}
+        matched: list[str] = []
+        for token in tokens:
+            cat = keyword_to_category.get(token)
+            if not cat:
+                continue
+            weight = float(keyword_to_weight.get(token, 1.0))
+            scores[cat] = scores.get(cat, 0.0) + weight
+            matched.append(token)
+        if not scores:
+            continue
+        best_cat = max(scores.items(), key=lambda item: item[1])[0]
+        out.at[idx, "SecondarySuggestedCategorisation"] = best_cat
+        out.at[idx, "SecondaryKeywords"] = ", ".join(sorted(matched))
+        out.at[idx, "SecondaryScore"] = round(float(scores[best_cat]), 3)
+
     return out
 
 
@@ -502,7 +639,7 @@ with st.sidebar:
     new_csv_file = st.file_uploader("New transactions (.csv)", type=["csv"], key="csv")
 
 try:
-    history_df = _load_main_workbook(MAIN_WORKBOOK_PATH)
+    history_df, keyword_rules_existing = _load_main_workbook(MAIN_WORKBOOK_PATH)
 except ValueError as exc:
     st.error(str(exc))
     st.caption("Tip: Commit a workbook named Household_Expenses.xlsx at the repo root.")
@@ -538,10 +675,13 @@ else:
     st.caption("No duplicates detected in uploaded transactions.")
 
 reference_df = _build_reference_from_history(history_df, history_category_col)
+keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_category_col)
+keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
 _render_reference_view(reference_df)
 
 if st.button("Run Auto-Categorization", type="primary"):
     predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
+    predicted_df = _add_secondary_keyword_suggestions(predicted_df, csv_type, keyword_rules)
     st.session_state["predicted_df"] = predicted_df
 
 if "predicted_df" not in st.session_state:
@@ -551,21 +691,69 @@ st.subheader("3) Review and Approve")
 predicted_df = st.session_state["predicted_df"].copy()
 match_count = int((predicted_df["SuggestedCategorisation"].astype(str).str.strip() != "").sum())
 st.caption(f"Matched from Household_Expenses.xlsx: {match_count} of {len(predicted_df)} transactions")
+if "edited_df" not in st.session_state:
+    st.session_state["edited_df"] = predicted_df.copy()
+if len(st.session_state["edited_df"]) != len(predicted_df):
+    st.session_state["edited_df"] = predicted_df.copy()
 
-edited_df = st.data_editor(
-    predicted_df,
-    use_container_width=True,
-    num_rows="fixed",
-    column_config={
-        "SuggestedCategorisation": st.column_config.TextColumn("SuggestedCategorisation", disabled=True),
-        "FinalCategorisation": st.column_config.TextColumn(
-            "FinalCategorisation",
-            help="Enter manually when no suggestion is provided.",
-        ),
-        "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
-        "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
-    },
-)
+primary_tab, secondary_tab = st.tabs(["Primary - Exact Match", "Secondary - Keyword Match"])
+with primary_tab:
+    edited_df = st.data_editor(
+        st.session_state["edited_df"],
+        use_container_width=True,
+        num_rows="fixed",
+        column_config={
+            "SuggestedCategorisation": st.column_config.TextColumn("SuggestedCategorisation", disabled=True),
+            "FinalCategorisation": st.column_config.TextColumn(
+                "FinalCategorisation",
+                help="Enter manually when no suggestion is provided.",
+            ),
+            "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
+            "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
+            "SecondarySuggestedCategorisation": st.column_config.TextColumn("SecondarySuggestedCategorisation", disabled=True),
+            "SecondaryKeywords": st.column_config.TextColumn("SecondaryKeywords", disabled=True),
+            "SecondaryScore": st.column_config.NumberColumn("SecondaryScore", disabled=True, format="%.3f"),
+        },
+    )
+    st.session_state["edited_df"] = edited_df
+
+with secondary_tab:
+    st.caption("Best alternative matches based on recurring keywords from workbook history.")
+    secondary_view = st.session_state["edited_df"].copy()
+    secondary_view = secondary_view[secondary_view["SuggestedCategorisation"].astype(str).str.strip() == ""]
+    secondary_view = secondary_view[
+        [
+            c
+            for c in [
+                "Unique Id",
+                "Description",
+                "Reference",
+                "Payee",
+                "Memo",
+                "Amount",
+                "SuggestedCategorisation",
+                "SecondarySuggestedCategorisation",
+                "SecondaryKeywords",
+                "SecondaryScore",
+                "FinalCategorisation",
+            ]
+            if c in secondary_view.columns
+        ]
+    ]
+    if secondary_view.empty:
+        st.info("No unmatched transactions for keyword suggestions.")
+    else:
+        st.dataframe(secondary_view, use_container_width=True, hide_index=True)
+        if st.button("Apply secondary suggestions to blank FinalCategorisation"):
+            edited = st.session_state["edited_df"].copy()
+            blank_final = edited["FinalCategorisation"].fillna("").astype(str).str.strip() == ""
+            has_secondary = edited["SecondarySuggestedCategorisation"].fillna("").astype(str).str.strip() != ""
+            mask = blank_final & has_secondary
+            edited.loc[mask, "FinalCategorisation"] = edited.loc[mask, "SecondarySuggestedCategorisation"]
+            st.session_state["edited_df"] = edited
+            st.success(f"Applied keyword suggestions to {int(mask.sum())} transactions.")
+
+edited_df = st.session_state["edited_df"].copy()
 
 approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
 if approve and st.button("Merge and Download Updated Workbook", type="primary"):
@@ -575,10 +763,15 @@ if approve and st.button("Merge and Download Updated Workbook", type="primary"):
         st.stop()
 
     merged = _merge_for_export(history_df, edited_df)
+    keyword_rules_out = _merge_keyword_rules(
+        keyword_rules,
+        _build_keyword_rules_from_history(merged, CATEGORY_COL if CATEGORY_COL in merged.columns else history_category_col),
+    )
 
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         merged.to_excel(writer, index=False, sheet_name="Master")
+        keyword_rules_out.to_excel(writer, index=False, sheet_name=KEYWORD_SHEET_NAME)
 
     file_name = "Household_Expenses.xlsx"
 

@@ -6,7 +6,9 @@ A Streamlit app that:
 2. Loads new transactions from one of two supported native bank `.csv` formats.
 3. Automatically detects and ignores any rows above the CSV header row.
 4. Auto-categorizes by exact reference match from `Household_Expenses.xlsx`.
-5. Pauses for manual review/approval.
+5. Provides a secondary keyword-based suggestion screen for unmatched transactions.
+6. Stores recurring keyword mappings on a second worksheet named `KeywordRules` within `Household_Expenses.xlsx`.
+7. Pauses for manual review/approval.
 6. Merges approved rows into an updated master workbook and writes a `Categorisation` column.
 
 ## Supported CSV Headers
