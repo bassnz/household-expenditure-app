@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Optional
 from zipfile import BadZipFile, ZipFile
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -295,6 +296,60 @@ def _coerce_date_columns_for_excel(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _build_dashboard_frame(history_df: pd.DataFrame, category_col: str, period_mode: str) -> pd.DataFrame:
+    date_col = _first_existing(history_df.columns.tolist(), ["Date of Transaction", "Date Processed", "Date"])
+    if not date_col or "Amount" not in history_df.columns:
+        return pd.DataFrame(columns=["Period", "Category", "Amount"])
+
+    work = history_df.copy()
+    dayfirst = pd.to_datetime(work[date_col], errors="coerce", dayfirst=True)
+    monthfirst = pd.to_datetime(work[date_col], errors="coerce", dayfirst=False)
+    work["_date"] = dayfirst.fillna(monthfirst)
+    work["_amount"] = pd.to_numeric(work["Amount"], errors="coerce")
+    work["_category"] = work[category_col].fillna("Uncategorised").astype(str).str.strip()
+    work = work.dropna(subset=["_date", "_amount"])
+
+    freq = {"Month": "M", "Quarter": "Q", "Year": "Y"}[period_mode]
+    work["_period"] = work["_date"].dt.to_period(freq).astype(str)
+
+    grouped = (
+        work.groupby(["_period", "_category"], as_index=False)["_amount"]
+        .sum()
+        .rename(columns={"_period": "Period", "_category": "Category", "_amount": "Amount"})
+    )
+    return grouped.sort_values(["Period", "Category"])
+
+
+def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
+    st.subheader("Spending Dashboard")
+    period_mode = st.radio("Time period", options=["Month", "Quarter", "Year"], horizontal=True, key="period_mode")
+
+    dashboard_df = _build_dashboard_frame(history_df, category_col, period_mode)
+    if dashboard_df.empty:
+        st.warning("Dashboard could not be generated. Ensure Household_Expenses.xlsx has a date column and Amount.")
+        return
+
+    pivot = (
+        dashboard_df.pivot(index="Category", columns="Period", values="Amount")
+        .fillna(0.0)
+        .sort_index()
+    )
+    st.dataframe(pivot, use_container_width=True)
+
+    chart = (
+        alt.Chart(dashboard_df)
+        .mark_bar()
+        .encode(
+            x=alt.X("Period:N", title=period_mode),
+            y=alt.Y("Amount:Q", title="Total Amount"),
+            color=alt.Color("Category:N", title="Categorisation"),
+            tooltip=["Period", "Category", alt.Tooltip("Amount:Q", format=",.2f")],
+        )
+        .properties(height=380)
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+
 def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
     history = history_df.copy()
     if CATEGORY_COL not in history.columns:
@@ -337,10 +392,6 @@ with st.sidebar:
     st.header("1) Upload New CSV")
     new_csv_file = st.file_uploader("New transactions (.csv)", type=["csv"], key="csv")
 
-if not new_csv_file:
-    st.info("Upload a CSV to continue.")
-    st.stop()
-
 try:
     history_df = _load_main_workbook(MAIN_WORKBOOK_PATH)
 except ValueError as exc:
@@ -351,6 +402,14 @@ except ValueError as exc:
 history_category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
 if not history_category_col:
     st.error("Household_Expenses.xlsx must contain a category column (Categorisation or Category).")
+    st.stop()
+
+_render_dashboard(history_df, history_category_col)
+st.divider()
+
+if not new_csv_file:
+    st.subheader("Transaction Categorizer")
+    st.info("Upload a CSV to continue.")
     st.stop()
 
 try:
