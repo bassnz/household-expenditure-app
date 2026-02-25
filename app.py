@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import importlib.util
 import io
 from datetime import datetime
 from pathlib import Path
@@ -127,15 +128,25 @@ def _load_history_xlsx(uploaded_file) -> pd.DataFrame:
     except Exception as exc:  # noqa: BLE001
         openpyxl_exc = exc
 
-    try:
-        return pd.read_excel(io.BytesIO(raw_bytes), engine="calamine")
-    except Exception as calamine_exc:  # noqa: BLE001
+    calamine_available = importlib.util.find_spec("python_calamine") is not None
+    if calamine_available:
+        try:
+            return pd.read_excel(io.BytesIO(raw_bytes), engine="calamine")
+        except Exception as calamine_exc:  # noqa: BLE001
+            st.error(
+                "Could not read the historical workbook with either parser. "
+                "Please re-save it as a standard .xlsx workbook and try again."
+            )
+            st.caption(f"openpyxl detail: {openpyxl_exc}")
+            st.caption(f"calamine detail: {calamine_exc}")
+            st.stop()
+    else:
         st.error(
-            "Could not read the historical workbook with either parser. "
+            "Could not read the historical workbook with openpyxl. "
             "Please re-save it as a standard .xlsx workbook and try again."
         )
         st.caption(f"openpyxl detail: {openpyxl_exc}")
-        st.caption(f"calamine detail: {calamine_exc}")
+        st.caption("calamine fallback is not installed in this runtime.")
         st.stop()
 
 
@@ -333,6 +344,19 @@ def _prepare_history(history_df: pd.DataFrame) -> str:
     return category_col
 
 
+def _coerce_date_columns_for_excel(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    date_columns = ["Date", "Date Processed", "Date of Transaction"]
+    for col in date_columns:
+        if col not in out.columns:
+            continue
+        series = out[col]
+        parsed_dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
+        parsed_monthfirst = pd.to_datetime(series, errors="coerce", dayfirst=False)
+        out[col] = parsed_dayfirst.fillna(parsed_monthfirst)
+    return out
+
+
 def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
     history = history_df.copy()
     if CATEGORY_COL not in history.columns:
@@ -343,7 +367,8 @@ def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.D
     incoming = incoming.drop(columns=["SuggestedCategorisation", "FinalCategorisation", "MatchStatus"], errors="ignore")
 
     all_columns = list(dict.fromkeys(history.columns.tolist() + incoming.columns.tolist()))
-    return pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
+    merged = pd.concat([history.reindex(columns=all_columns), incoming.reindex(columns=all_columns)], ignore_index=True)
+    return _coerce_date_columns_for_excel(merged)
 
 
 with st.sidebar:
