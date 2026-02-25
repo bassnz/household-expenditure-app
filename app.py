@@ -34,6 +34,7 @@ TYPE2_HEADERS = [
 
 CATEGORY_COL = "Categorisation"
 MAIN_WORKBOOK_PATH = Path("Household_Expenses.xlsx")
+LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments"}
 
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
@@ -392,12 +393,25 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         .unique()
         .tolist()
     )
-    st.markdown("**Category Filters**")
+    upper_categories = [c for c in all_categories if c not in LOWER_GROUP_CATEGORIES]
+    lower_categories = [c for c in all_categories if c in LOWER_GROUP_CATEGORIES]
+
+    st.markdown("**Category Filters (Upper Group)**")
     filter_cols = st.columns(4)
     selected_categories: list[str] = []
-    for idx, category in enumerate(all_categories):
+    for idx, category in enumerate(upper_categories):
         key = f"dash_cat_{hashlib.md5(category.encode('utf-8')).hexdigest()[:10]}"
         col = filter_cols[idx % 4]
+        with col:
+            checked = st.checkbox(category, value=st.session_state.get(key, True), key=key)
+        if checked:
+            selected_categories.append(category)
+
+    st.markdown("**Category Filters (Lower Group)**")
+    lower_cols = st.columns(3)
+    for idx, category in enumerate(lower_categories):
+        key = f"dash_cat_{hashlib.md5(category.encode('utf-8')).hexdigest()[:10]}"
+        col = lower_cols[idx % 3]
         with col:
             checked = st.checkbox(category, value=st.session_state.get(key, True), key=key)
         if checked:
@@ -417,16 +431,27 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         .fillna(0.0)
         .sort_index()
     )
-    st.dataframe(pivot, use_container_width=True)
+    def _fmt_accounting(value: object) -> str:
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if num < 0:
+            return f"({abs(num):,.0f})"
+        return f"{num:,.0f}"
 
+    st.dataframe(pivot.style.format(_fmt_accounting), use_container_width=True)
+
+    dashboard_chart_df = dashboard_df.copy()
+    dashboard_chart_df["AmountDisplay"] = dashboard_chart_df["Amount"].map(_fmt_accounting)
     chart = (
-        alt.Chart(dashboard_df)
+        alt.Chart(dashboard_chart_df)
         .mark_bar()
         .encode(
             x=alt.X("Period:N", title=period_mode),
             y=alt.Y("Amount:Q", title="Total Amount"),
             color=alt.Color("Category:N", title="Categorisation"),
-            tooltip=["Period", "Category", alt.Tooltip("Amount:Q", format=",.2f")],
+            tooltip=["Period", "Category", alt.Tooltip("AmountDisplay:N", title="Amount")],
         )
         .properties(height=380)
     )
