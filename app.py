@@ -34,7 +34,7 @@ TYPE2_HEADERS = [
 
 CATEGORY_COL = "Categorisation"
 MAIN_WORKBOOK_PATH = Path("Household_Expenses.xlsx")
-LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments"}
+LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa"}
 
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
@@ -396,7 +396,7 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
     upper_categories = [c for c in all_categories if c not in LOWER_GROUP_CATEGORIES]
     lower_categories = [c for c in all_categories if c in LOWER_GROUP_CATEGORIES]
 
-    st.markdown("**Category Filters (Upper Group)**")
+    st.markdown("**Category Filters - Expenses**")
     filter_cols = st.columns(4)
     selected_categories: list[str] = []
     for idx, category in enumerate(upper_categories):
@@ -407,7 +407,7 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         if checked:
             selected_categories.append(category)
 
-    st.markdown("**Category Filters (Lower Group)**")
+    st.markdown("**Category Filters - Others**")
     lower_cols = st.columns(3)
     for idx, category in enumerate(lower_categories):
         key = f"dash_cat_{hashlib.md5(category.encode('utf-8')).hexdigest()[:10]}"
