@@ -33,7 +33,7 @@ TYPE2_HEADERS = [
 ]
 
 CATEGORY_COL = "Categorisation"
-LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa"}
+LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa", "Work Visa"}
 KEYWORD_SHEET_NAME = "Keywords"
 KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
 STOPWORDS = {
@@ -139,6 +139,14 @@ def _build_workbook_bytes(master_df: pd.DataFrame, keyword_rules_df: pd.DataFram
         master_df.to_excel(writer, index=False, sheet_name="Master")
         keyword_rules_df.to_excel(writer, index=False, sheet_name=KEYWORD_SHEET_NAME)
     return output.getvalue()
+
+
+def _prediction_signature(df: pd.DataFrame) -> str:
+    sig_cols = [c for c in ["Unique Id", "Amount", "Date", "Date Processed", "Date of Transaction", "Description", "Payee", "Memo"] if c in df.columns]
+    if not sig_cols:
+        return str(len(df))
+    payload = df[sig_cols].fillna("").astype(str)
+    return str(hash(pd.util.hash_pandas_object(payload, index=False).sum()))
 
 
 def _first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
@@ -555,7 +563,7 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         key = f"dash_cat_{hashlib.md5(category.encode('utf-8')).hexdigest()[:10]}"
         col = lower_cols[idx % 3]
         with col:
-            checked = st.checkbox(category, value=st.session_state.get(key, True), key=key)
+            checked = st.checkbox(category, value=st.session_state.get(key, False), key=key)
         if checked:
             selected_categories.append(category)
 
@@ -706,7 +714,9 @@ keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_ca
 keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
 if "keyword_rules_refreshed" in st.session_state:
     keyword_rules = _merge_keyword_rules(keyword_rules, st.session_state["keyword_rules_refreshed"])
-_render_reference_view(reference_df)
+show_reference_set = st.toggle("Show Reference Set (from Household_Expenses.xlsx)", value=True)
+if show_reference_set:
+    _render_reference_view(reference_df)
 
 if not new_csv_file:
     st.info("Upload a CSV to run categorization.")
@@ -730,6 +740,8 @@ else:
             predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
             predicted_df = _apply_keyword_fallback_suggestions(predicted_df, csv_type, keyword_rules)
             st.session_state["predicted_df"] = predicted_df
+            st.session_state["edited_df"] = predicted_df.copy()
+            st.session_state["prediction_signature"] = _prediction_signature(predicted_df)
 
     if "predicted_df" in st.session_state:
         st.subheader("3) Review and Approve")
@@ -739,10 +751,11 @@ else:
         st.caption(
             f"Matched from Household_Expenses.xlsx: Exact={exact_count}, Keyword={keyword_count}, Total={len(predicted_df)}"
         )
-        if "edited_df" not in st.session_state:
+        current_sig = _prediction_signature(predicted_df)
+        if "edited_df" not in st.session_state or st.session_state.get("prediction_signature") != current_sig:
             st.session_state["edited_df"] = predicted_df.copy()
-        if len(st.session_state["edited_df"]) != len(predicted_df):
-            st.session_state["edited_df"] = predicted_df.copy()
+            st.session_state["prediction_signature"] = current_sig
+        editor_key = f"primary_editor_{st.session_state['prediction_signature']}"
 
         edited_df = st.data_editor(
             st.session_state["edited_df"],
@@ -760,7 +773,7 @@ else:
                 "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
                 "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
             },
-            key="primary_editor",
+            key=editor_key,
         )
         st.session_state["edited_df"] = edited_df
 
