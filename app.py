@@ -33,7 +33,7 @@ TYPE2_HEADERS = [
 ]
 
 CATEGORY_COL = "Categorisation"
-LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa", "Work Visa"}
+LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa", "Work Visa", "Dividend"}
 KEYWORD_SHEET_NAME = "Keywords"
 KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
 STOPWORDS = {
@@ -316,11 +316,12 @@ def _build_keyword_rules_from_history(history_df: pd.DataFrame, category_col: st
     token_df = pd.DataFrame(token_records, columns=["Keyword", CATEGORY_COL])
     counts = token_df.groupby(["Keyword", CATEGORY_COL], as_index=False).size().rename(columns={"size": "MatchCount"})
     totals = counts.groupby("Keyword", as_index=False)["MatchCount"].sum().rename(columns={"MatchCount": "TotalCount"})
-    merged = counts.merge(totals, on="Keyword", how="left")
+    category_span = counts.groupby("Keyword", as_index=False)[CATEGORY_COL].nunique().rename(columns={CATEGORY_COL: "CategoryCount"})
+    merged = counts.merge(totals, on="Keyword", how="left").merge(category_span, on="Keyword", how="left")
     merged["Confidence"] = merged["MatchCount"] / merged["TotalCount"]
 
-    # Keep only recurring terms with a dominant category mapping.
-    merged = merged[(merged["TotalCount"] >= 2) & (merged["MatchCount"] >= 2) & (merged["Confidence"] >= 0.6)]
+    # Keep recurring terms that map to exactly one category (distinct keywords only).
+    merged = merged[(merged["CategoryCount"] == 1) & (merged["TotalCount"] >= 2) & (merged["MatchCount"] >= 2)]
     merged = merged.sort_values(["Keyword", "Confidence", "MatchCount"], ascending=[True, False, False])
     rules = merged.drop_duplicates(subset=["Keyword"], keep="first").copy()
     rules["LastUpdated"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -329,19 +330,28 @@ def _build_keyword_rules_from_history(history_df: pd.DataFrame, category_col: st
 
 
 def _merge_keyword_rules(existing_rules: pd.DataFrame, derived_rules: pd.DataFrame) -> pd.DataFrame:
-    out = pd.concat([existing_rules, derived_rules], ignore_index=True)
-    for col in KEYWORD_RULE_COLUMNS:
-        if col not in out.columns:
-            out[col] = pd.NA
-    out = out[KEYWORD_RULE_COLUMNS]
-    out["Keyword"] = out["Keyword"].fillna("").astype(str).str.strip().str.lower()
-    out[CATEGORY_COL] = out[CATEGORY_COL].fillna("").astype(str).str.strip()
-    out["MatchCount"] = pd.to_numeric(out["MatchCount"], errors="coerce").fillna(0).astype(int)
-    out["TotalCount"] = pd.to_numeric(out["TotalCount"], errors="coerce").fillna(0).astype(int)
-    out["Confidence"] = pd.to_numeric(out["Confidence"], errors="coerce").fillna(0.0)
-    out = out[(out["Keyword"] != "") & (out[CATEGORY_COL] != "")]
-    out = out.sort_values(["Keyword", "Confidence", "MatchCount"], ascending=[True, False, False])
-    return out.drop_duplicates(subset=["Keyword"], keep="first")
+    def _clean(df: pd.DataFrame) -> pd.DataFrame:
+        out = df.copy()
+        for col in KEYWORD_RULE_COLUMNS:
+            if col not in out.columns:
+                out[col] = pd.NA
+        out = out[KEYWORD_RULE_COLUMNS]
+        out["Keyword"] = out["Keyword"].fillna("").astype(str).str.strip().str.lower()
+        out[CATEGORY_COL] = out[CATEGORY_COL].fillna("").astype(str).str.strip()
+        out["MatchCount"] = pd.to_numeric(out["MatchCount"], errors="coerce").fillna(0).astype(int)
+        out["TotalCount"] = pd.to_numeric(out["TotalCount"], errors="coerce").fillna(0).astype(int)
+        out["Confidence"] = pd.to_numeric(out["Confidence"], errors="coerce").fillna(0.0)
+        out = out[(out["Keyword"] != "") & (out[CATEGORY_COL] != "")]
+        return out
+
+    existing = _clean(existing_rules).drop_duplicates(subset=["Keyword"], keep="first")
+    derived = _clean(derived_rules).drop_duplicates(subset=["Keyword"], keep="first")
+
+    # Preserve existing (manually curated) keyword categorisations when present.
+    merged = derived[~derived["Keyword"].isin(set(existing["Keyword"]))].copy()
+    merged = pd.concat([existing, merged], ignore_index=True)
+    merged = merged.sort_values(["Keyword", "Confidence", "MatchCount"], ascending=[True, False, False])
+    return merged.drop_duplicates(subset=["Keyword"], keep="first")
 
 
 def _majority_category(series: pd.Series) -> str:
@@ -682,30 +692,42 @@ st.caption(
 refreshed_keywords = _build_keyword_rules_from_history(history_df, history_category_col)
 keywords_to_show = refreshed_keywords if not refreshed_keywords.empty else keyword_rules_existing
 if st.button("Refresh Keyword Categories", type="primary"):
-    st.session_state["keyword_rules_refreshed"] = refreshed_keywords
-    workbook_bytes = _build_workbook_bytes(history_df, refreshed_keywords)
-    st.success("Keywords worksheet refreshed. Download the updated workbook.")
-    st.download_button(
-        label="Download Household_Expenses.xlsx (with Keywords)",
-        data=workbook_bytes,
-        file_name="Household_Expenses.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key="download_keywords_refresh",
-    )
+    existing_for_refresh = st.session_state.get("keyword_rules_refreshed", keyword_rules_existing)
+    st.session_state["keyword_rules_refreshed"] = _merge_keyword_rules(existing_for_refresh, refreshed_keywords)
+    st.success("Keywords refreshed from Master. Review/edit below, then download.")
 
 if "keyword_rules_refreshed" in st.session_state:
     keywords_to_show = st.session_state["keyword_rules_refreshed"]
 
+hide_keyword_table = st.toggle("Hide keyword table", value=False)
+
 if keywords_to_show.empty:
     st.info("No recurring category keywords found yet.")
-else:
-    st.dataframe(
-        keywords_to_show[[CATEGORY_COL, "Keyword", "MatchCount", "TotalCount", "Confidence"]]
-        .sort_values([CATEGORY_COL, "Keyword"])
-        .reset_index(drop=True),
+elif not hide_keyword_table:
+    editable_keywords = st.data_editor(
+        keywords_to_show[KEYWORD_RULE_COLUMNS].sort_values(["Keyword"]).reset_index(drop=True),
         use_container_width=True,
-        hide_index=True,
+        num_rows="fixed",
+        column_config={
+            "Keyword": st.column_config.TextColumn("Keyword", disabled=True),
+            "MatchCount": st.column_config.NumberColumn("MatchCount", disabled=True, format="%d"),
+            "TotalCount": st.column_config.NumberColumn("TotalCount", disabled=True, format="%d"),
+            "Confidence": st.column_config.NumberColumn("Confidence", disabled=True, format="%.3f"),
+            CATEGORY_COL: st.column_config.TextColumn(CATEGORY_COL, help="You can recategorise a keyword here."),
+        },
+        key="keywords_editor",
     )
+    st.session_state["keyword_rules_refreshed"] = _merge_keyword_rules(editable_keywords, pd.DataFrame(columns=KEYWORD_RULE_COLUMNS))
+
+rules_to_write = st.session_state.get("keyword_rules_refreshed", keywords_to_show)
+workbook_bytes_keywords = _build_workbook_bytes(history_df, rules_to_write)
+st.download_button(
+    label="Download Household_Expenses.xlsx (with Keywords)",
+    data=workbook_bytes_keywords,
+    file_name="Household_Expenses.xlsx",
+    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    key="download_keywords_refresh",
+)
 
 st.divider()
 st.subheader("2) Auto-Categorization")
@@ -713,7 +735,7 @@ reference_df = _build_reference_from_history(history_df, history_category_col)
 keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_category_col)
 keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
 if "keyword_rules_refreshed" in st.session_state:
-    keyword_rules = _merge_keyword_rules(keyword_rules, st.session_state["keyword_rules_refreshed"])
+    keyword_rules = _merge_keyword_rules(st.session_state["keyword_rules_refreshed"], pd.DataFrame(columns=KEYWORD_RULE_COLUMNS))
 show_reference_set = st.toggle("Show Reference Set (from Household_Expenses.xlsx)", value=True)
 if show_reference_set:
     _render_reference_view(reference_df)
