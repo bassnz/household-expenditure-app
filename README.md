@@ -6,10 +6,9 @@ A Streamlit app that:
 3. Loads new transactions from one of two supported native bank `.csv` formats.
 4. Automatically detects and ignores any rows above the CSV header row.
 5. Auto-categorizes with a single suggested category and match type (`Exact Match` or `Keyword Match`) from the uploaded workbook.
-6. Shows all workflows on one page in sequence (dashboard -> CSV categorization -> category maintenance).
-7. Stores recurring keyword mappings on a second worksheet named `KeywordRules` within `Household_Expenses.xlsx`.
-8. Supports direct category maintenance without CSV merge via an "Update Existing Categories" screen.
-9. Merges approved rows into an updated workbook and writes a `Categorisation` column.
+6. Shows all workflows on one page in sequence (dashboard -> keyword refresh -> CSV categorization).
+7. Stores recurring keyword mappings on a second worksheet named `Keywords` within `Household_Expenses.xlsx`.
+8. Merges approved rows into an updated workbook and writes a `Categorisation` column.
 
 ## Supported CSV Headers
 

@@ -34,7 +34,7 @@ TYPE2_HEADERS = [
 
 CATEGORY_COL = "Categorisation"
 LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa"}
-KEYWORD_SHEET_NAME = "KeywordRules"
+KEYWORD_SHEET_NAME = "Keywords"
 KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
 STOPWORDS = {
     "the",
@@ -58,7 +58,7 @@ STOPWORDS = {
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
 st.title("Transaction Categorizer")
-st.caption("Upload Household_Expenses.xlsx each session. CSV categorization and category maintenance are both available.")
+st.caption("Upload Household_Expenses.xlsx each session. Refresh keyword mappings and run CSV categorization.")
 
 
 def _read_text_bytes(raw_bytes: bytes) -> str:
@@ -285,7 +285,7 @@ def _build_reference_from_history(history_df: pd.DataFrame, category_col: str) -
 
 
 def _build_keyword_rules_from_history(history_df: pd.DataFrame, category_col: str) -> pd.DataFrame:
-    text_cols = [c for c in ["Description", "Payee", "Memo", "Reference"] if c in history_df.columns]
+    text_cols = [c for c in ["Description", "Payee", "Memo"] if c in history_df.columns]
     if not text_cols:
         return pd.DataFrame(columns=KEYWORD_RULE_COLUMNS)
 
@@ -666,10 +666,46 @@ if not history_category_col:
 
 _render_dashboard(history_df, history_category_col)
 st.divider()
+
+st.subheader("1) Refresh Keyword Categories")
+st.caption(
+    "Create or update worksheet 'Keywords' from recurring words in Master fields: Description, Payee, and Memo."
+)
+refreshed_keywords = _build_keyword_rules_from_history(history_df, history_category_col)
+keywords_to_show = refreshed_keywords if not refreshed_keywords.empty else keyword_rules_existing
+if st.button("Refresh Keyword Categories", type="primary"):
+    st.session_state["keyword_rules_refreshed"] = refreshed_keywords
+    workbook_bytes = _build_workbook_bytes(history_df, refreshed_keywords)
+    st.success("Keywords worksheet refreshed. Download the updated workbook.")
+    st.download_button(
+        label="Download Household_Expenses.xlsx (with Keywords)",
+        data=workbook_bytes,
+        file_name="Household_Expenses.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key="download_keywords_refresh",
+    )
+
+if "keyword_rules_refreshed" in st.session_state:
+    keywords_to_show = st.session_state["keyword_rules_refreshed"]
+
+if keywords_to_show.empty:
+    st.info("No recurring category keywords found yet.")
+else:
+    st.dataframe(
+        keywords_to_show[[CATEGORY_COL, "Keyword", "MatchCount", "TotalCount", "Confidence"]]
+        .sort_values([CATEGORY_COL, "Keyword"])
+        .reset_index(drop=True),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+st.divider()
 st.subheader("2) Auto-Categorization")
 reference_df = _build_reference_from_history(history_df, history_category_col)
 keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_category_col)
 keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
+if "keyword_rules_refreshed" in st.session_state:
+    keyword_rules = _merge_keyword_rules(keyword_rules, st.session_state["keyword_rules_refreshed"])
 _render_reference_view(reference_df)
 
 if not new_csv_file:
@@ -749,42 +785,5 @@ else:
                 data=workbook_bytes,
                 file_name="Household_Expenses.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_merged_workbook",
             )
-
-st.divider()
-st.subheader("4) Update Existing Categories")
-st.caption("Edit category values directly in Household_Expenses.xlsx and download the updated workbook without CSV merge.")
-maintenance_df = history_df.copy()
-if CATEGORY_COL not in maintenance_df.columns:
-    maintenance_df[CATEGORY_COL] = pd.NA
-
-editable_cols = [c for c in ["True Date", "Date", "Date Processed", "Date of Transaction", "Unique Id", "Description", "Payee", "Memo", "Amount", CATEGORY_COL] if c in maintenance_df.columns]
-if not editable_cols:
-    st.info("No editable columns found.")
-else:
-    edited_master = st.data_editor(
-        maintenance_df[editable_cols],
-        use_container_width=True,
-        num_rows="fixed",
-        column_config={
-            CATEGORY_COL: st.column_config.TextColumn(CATEGORY_COL, help="Edit categories directly."),
-        },
-        key="maintenance_editor",
-    )
-    if st.button("Download Workbook With Updated Categories", type="primary"):
-        updated = history_df.copy()
-        updated[CATEGORY_COL] = edited_master[CATEGORY_COL]
-        updated = _coerce_date_columns_for_excel(updated)
-        updated = _update_true_date(updated)
-        keyword_rules_out = _merge_keyword_rules(
-            keyword_rules_existing,
-            _build_keyword_rules_from_history(updated, CATEGORY_COL),
-        )
-        workbook_bytes = _build_workbook_bytes(updated, keyword_rules_out)
-        st.success("Updated categories applied. Download the workbook.")
-        st.download_button(
-            label="Download Household_Expenses.xlsx",
-            data=workbook_bytes,
-            file_name="Household_Expenses.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
