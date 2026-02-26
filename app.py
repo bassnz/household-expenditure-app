@@ -97,11 +97,7 @@ def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
     return df[expected].copy(), csv_type
 
 
-def _load_main_workbook(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if uploaded_file is None:
-        raise ValueError("Upload Household_Expenses.xlsx to continue.")
-
-    raw_bytes = uploaded_file.getvalue()
+def _load_main_workbook_from_bytes(raw_bytes: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
     if not raw_bytes:
         raise ValueError("Main workbook is empty.")
 
@@ -672,7 +668,21 @@ with st.sidebar:
     new_csv_file = st.file_uploader("New transactions (.csv)", type=["csv"], key="csv")
 
 try:
-    history_df, keyword_rules_existing = _load_main_workbook(main_workbook_file)
+    if main_workbook_file is None:
+        raise ValueError("Upload Household_Expenses.xlsx to continue.")
+    workbook_bytes = main_workbook_file.getvalue()
+    workbook_sig = hashlib.md5(workbook_bytes).hexdigest()
+    if st.session_state.get("loaded_workbook_sig") != workbook_sig:
+        parsed_history, parsed_keywords = _load_main_workbook_from_bytes(workbook_bytes)
+        st.session_state["loaded_workbook_sig"] = workbook_sig
+        st.session_state["loaded_history_df"] = parsed_history
+        st.session_state["loaded_keyword_rules"] = parsed_keywords
+        st.session_state.pop("predicted_df", None)
+        st.session_state.pop("edited_df", None)
+        st.session_state.pop("prediction_signature", None)
+        st.session_state.pop("keyword_rules_refreshed", None)
+    history_df = st.session_state["loaded_history_df"].copy()
+    keyword_rules_existing = st.session_state["loaded_keyword_rules"].copy()
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -699,7 +709,7 @@ if st.button("Refresh Keyword Categories", type="primary"):
 if "keyword_rules_refreshed" in st.session_state:
     keywords_to_show = st.session_state["keyword_rules_refreshed"]
 
-hide_keyword_table = st.toggle("Hide keyword table", value=False)
+hide_keyword_table = st.toggle("Hide keyword table", value=True)
 
 if keywords_to_show.empty:
     st.info("No recurring category keywords found yet.")
@@ -736,8 +746,8 @@ keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_ca
 keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
 if "keyword_rules_refreshed" in st.session_state:
     keyword_rules = _merge_keyword_rules(st.session_state["keyword_rules_refreshed"], pd.DataFrame(columns=KEYWORD_RULE_COLUMNS))
-show_reference_set = st.toggle("Show Reference Set (from Household_Expenses.xlsx)", value=True)
-if show_reference_set:
+hide_reference_set = st.toggle("Hide Reference Set (from Household_Expenses.xlsx)", value=True)
+if not hide_reference_set:
     _render_reference_view(reference_df)
 
 if not new_csv_file:
