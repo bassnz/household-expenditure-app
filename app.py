@@ -4,7 +4,6 @@ import csv
 import hashlib
 import io
 import re
-from pathlib import Path
 from typing import Optional
 from zipfile import BadZipFile, ZipFile
 
@@ -34,7 +33,6 @@ TYPE2_HEADERS = [
 ]
 
 CATEGORY_COL = "Categorisation"
-MAIN_WORKBOOK_PATH = Path("Household_Expenses.xlsx")
 LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa"}
 KEYWORD_SHEET_NAME = "KeywordRules"
 KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
@@ -60,7 +58,7 @@ STOPWORDS = {
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
 st.title("Transaction Categorizer")
-st.caption("Upload a new .csv file. Suggestions are generated from Household_Expenses.xlsx.")
+st.caption("Upload Household_Expenses.xlsx each session. CSV categorization and category maintenance are both available.")
 
 
 def _read_text_bytes(raw_bytes: bytes) -> str:
@@ -99,13 +97,11 @@ def _load_supported_csv(uploaded_file) -> tuple[pd.DataFrame, str]:
     return df[expected].copy(), csv_type
 
 
-def _load_main_workbook(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    if not path.exists():
-        raise ValueError(
-            f"Main workbook not found: {path}. Add Household_Expenses.xlsx to the repository root."
-        )
+def _load_main_workbook(uploaded_file) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if uploaded_file is None:
+        raise ValueError("Upload Household_Expenses.xlsx to continue.")
 
-    raw_bytes = path.read_bytes()
+    raw_bytes = uploaded_file.getvalue()
     if not raw_bytes:
         raise ValueError("Main workbook is empty.")
 
@@ -135,6 +131,14 @@ def _load_main_workbook(path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
         return history_df, keyword_df
     except Exception as exc:  # noqa: BLE001
         raise ValueError(f"Could not read main workbook: {exc}") from exc
+
+
+def _build_workbook_bytes(master_df: pd.DataFrame, keyword_rules_df: pd.DataFrame) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        master_df.to_excel(writer, index=False, sheet_name="Master")
+        keyword_rules_df.to_excel(writer, index=False, sheet_name=KEYWORD_SHEET_NAME)
+    return output.getvalue()
 
 
 def _first_existing(cols: list[str], candidates: list[str]) -> Optional[str]:
@@ -367,7 +371,7 @@ def _build_reference_lookups(reference_df: pd.DataFrame) -> tuple[dict[str, str]
 def _suggest_categories_from_reference(new_df: pd.DataFrame, csv_type: str, reference_df: pd.DataFrame) -> pd.DataFrame:
     out = new_df.copy()
     out["SuggestedCategorisation"] = ""
-    out["MatchStatus"] = "No match"
+    out["MatchType"] = ""
 
     type1_map, type2_map = _build_reference_lookups(reference_df)
     if csv_type == "type1":
@@ -378,18 +382,17 @@ def _suggest_categories_from_reference(new_df: pd.DataFrame, csv_type: str, refe
         matched = pd.Series([type2_map.get(k, "") for k in keys], index=out.index)
 
     out["SuggestedCategorisation"] = matched
-    out.loc[out["SuggestedCategorisation"] != "", "MatchStatus"] = "Matched reference"
+    out.loc[out["SuggestedCategorisation"] != "", "MatchType"] = "Exact Match"
     out["FinalCategorisation"] = out["SuggestedCategorisation"]
     return out
 
 
-def _add_secondary_keyword_suggestions(
+def _apply_keyword_fallback_suggestions(
     df: pd.DataFrame, csv_type: str, keyword_rules: pd.DataFrame
 ) -> pd.DataFrame:
     out = df.copy()
-    out["SecondarySuggestedCategorisation"] = ""
-    out["SecondaryKeywords"] = ""
-    out["SecondaryScore"] = 0
+    out["MatchedKeywords"] = ""
+    out["KeywordScore"] = 0
     if keyword_rules.empty:
         return out
 
@@ -420,12 +423,14 @@ def _add_secondary_keyword_suggestions(
             weight = float(keyword_to_weight.get(token, 1.0))
             scores[cat] = scores.get(cat, 0.0) + weight
             matched.append(token)
-        if not scores:
+        if not scores or str(out.at[idx, "SuggestedCategorisation"]).strip() != "":
             continue
         best_cat = max(scores.items(), key=lambda item: item[1])[0]
-        out.at[idx, "SecondarySuggestedCategorisation"] = best_cat
-        out.at[idx, "SecondaryKeywords"] = ", ".join(sorted(matched))
-        out.at[idx, "SecondaryScore"] = round(float(scores[best_cat]), 3)
+        out.at[idx, "SuggestedCategorisation"] = best_cat
+        out.at[idx, "FinalCategorisation"] = best_cat if str(out.at[idx, "FinalCategorisation"]).strip() == "" else out.at[idx, "FinalCategorisation"]
+        out.at[idx, "MatchType"] = "Keyword Match"
+        out.at[idx, "MatchedKeywords"] = ", ".join(sorted(matched))
+        out.at[idx, "KeywordScore"] = round(float(scores[best_cat]), 3)
 
     return out
 
@@ -604,7 +609,15 @@ def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.D
     incoming = incoming[~incoming["DuplicateFlag"].fillna(False)].copy()
     incoming[CATEGORY_COL] = incoming["FinalCategorisation"]
     incoming = incoming.drop(
-        columns=["SuggestedCategorisation", "FinalCategorisation", "MatchStatus", "DuplicateFlag", "DuplicateReason"],
+        columns=[
+            "SuggestedCategorisation",
+            "FinalCategorisation",
+            "MatchType",
+            "MatchedKeywords",
+            "KeywordScore",
+            "DuplicateFlag",
+            "DuplicateReason",
+        ],
         errors="ignore",
     )
 
@@ -635,14 +648,15 @@ def _render_reference_view(reference_df: pd.DataFrame) -> None:
 
 
 with st.sidebar:
-    st.header("1) Upload New CSV")
+    st.header("1) Upload Workbook")
+    main_workbook_file = st.file_uploader("Household_Expenses.xlsx", type=["xlsx"], key="main_workbook")
+    st.header("2) Upload New CSV (Optional)")
     new_csv_file = st.file_uploader("New transactions (.csv)", type=["csv"], key="csv")
 
 try:
-    history_df, keyword_rules_existing = _load_main_workbook(MAIN_WORKBOOK_PATH)
+    history_df, keyword_rules_existing = _load_main_workbook(main_workbook_file)
 except ValueError as exc:
     st.error(str(exc))
-    st.caption("Tip: Commit a workbook named Household_Expenses.xlsx at the repo root.")
     st.stop()
 
 history_category_col = _first_existing(history_df.columns.tolist(), [CATEGORY_COL, "Category", "category"])
@@ -652,133 +666,125 @@ if not history_category_col:
 
 _render_dashboard(history_df, history_category_col)
 st.divider()
-
-if not new_csv_file:
-    st.subheader("Transaction Categorizer")
-    st.info("Upload a CSV to continue.")
-    st.stop()
-
-try:
-    new_df, csv_type = _load_supported_csv(new_csv_file)
-except ValueError as exc:
-    st.error(str(exc))
-    st.stop()
-
-new_df, duplicate_report = _annotate_duplicates(new_df, history_df)
-
 st.subheader("2) Auto-Categorization")
-st.caption(f"Detected CSV format: {csv_type}")
-if not duplicate_report.empty:
-    st.warning(f"Duplicate transactions detected: {len(duplicate_report)}. They will be excluded from merge.")
-    st.dataframe(duplicate_report, use_container_width=True, hide_index=True)
-else:
-    st.caption("No duplicates detected in uploaded transactions.")
-
 reference_df = _build_reference_from_history(history_df, history_category_col)
 keyword_rules_derived = _build_keyword_rules_from_history(history_df, history_category_col)
 keyword_rules = _merge_keyword_rules(keyword_rules_existing, keyword_rules_derived)
 _render_reference_view(reference_df)
 
-if st.button("Run Auto-Categorization", type="primary"):
-    predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
-    predicted_df = _add_secondary_keyword_suggestions(predicted_df, csv_type, keyword_rules)
-    st.session_state["predicted_df"] = predicted_df
+if not new_csv_file:
+    st.info("Upload a CSV to run categorization.")
+else:
+    new_df = None
+    csv_type = ""
+    try:
+        new_df, csv_type = _load_supported_csv(new_csv_file)
+    except ValueError as exc:
+        st.error(str(exc))
+    if new_df is not None:
+        new_df, duplicate_report = _annotate_duplicates(new_df, history_df)
+        st.caption(f"Detected CSV format: {csv_type}")
+        if not duplicate_report.empty:
+            st.warning(f"Duplicate transactions detected: {len(duplicate_report)}. They will be excluded from merge.")
+            st.dataframe(duplicate_report, use_container_width=True, hide_index=True)
+        else:
+            st.caption("No duplicates detected in uploaded transactions.")
 
-if "predicted_df" not in st.session_state:
-    st.stop()
+        if st.button("Run Auto-Categorization", type="primary"):
+            predicted_df = _suggest_categories_from_reference(new_df, csv_type, reference_df)
+            predicted_df = _apply_keyword_fallback_suggestions(predicted_df, csv_type, keyword_rules)
+            st.session_state["predicted_df"] = predicted_df
 
-st.subheader("3) Review and Approve")
-predicted_df = st.session_state["predicted_df"].copy()
-match_count = int((predicted_df["SuggestedCategorisation"].astype(str).str.strip() != "").sum())
-st.caption(f"Matched from Household_Expenses.xlsx: {match_count} of {len(predicted_df)} transactions")
-if "edited_df" not in st.session_state:
-    st.session_state["edited_df"] = predicted_df.copy()
-if len(st.session_state["edited_df"]) != len(predicted_df):
-    st.session_state["edited_df"] = predicted_df.copy()
+    if "predicted_df" in st.session_state:
+        st.subheader("3) Review and Approve")
+        predicted_df = st.session_state["predicted_df"].copy()
+        exact_count = int((predicted_df["MatchType"] == "Exact Match").sum())
+        keyword_count = int((predicted_df["MatchType"] == "Keyword Match").sum())
+        st.caption(
+            f"Matched from Household_Expenses.xlsx: Exact={exact_count}, Keyword={keyword_count}, Total={len(predicted_df)}"
+        )
+        if "edited_df" not in st.session_state:
+            st.session_state["edited_df"] = predicted_df.copy()
+        if len(st.session_state["edited_df"]) != len(predicted_df):
+            st.session_state["edited_df"] = predicted_df.copy()
 
-primary_tab, secondary_tab = st.tabs(["Primary - Exact Match", "Secondary - Keyword Match"])
-with primary_tab:
-    edited_df = st.data_editor(
-        st.session_state["edited_df"],
+        edited_df = st.data_editor(
+            st.session_state["edited_df"],
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "SuggestedCategorisation": st.column_config.TextColumn("SuggestedCategorisation", disabled=True),
+                "MatchType": st.column_config.TextColumn("MatchType", disabled=True),
+                "MatchedKeywords": st.column_config.TextColumn("MatchedKeywords", disabled=True),
+                "KeywordScore": st.column_config.NumberColumn("KeywordScore", disabled=True, format="%.3f"),
+                "FinalCategorisation": st.column_config.TextColumn(
+                    "FinalCategorisation",
+                    help="Enter manually when no suggestion is provided.",
+                ),
+                "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
+                "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
+            },
+            key="primary_editor",
+        )
+        st.session_state["edited_df"] = edited_df
+
+        edited_df = st.session_state["edited_df"].copy()
+        approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
+        if approve and st.button("Merge and Download Updated Workbook", type="primary"):
+            missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
+            if bool(missing.any()):
+                st.error("Some non-duplicate transactions still have blank FinalCategorisation. Please complete them before merging.")
+                st.stop()
+
+            merged = _merge_for_export(history_df, edited_df)
+            keyword_rules_out = _merge_keyword_rules(
+                keyword_rules,
+                _build_keyword_rules_from_history(merged, CATEGORY_COL if CATEGORY_COL in merged.columns else history_category_col),
+            )
+
+            workbook_bytes = _build_workbook_bytes(merged, keyword_rules_out)
+            st.success("Merged successfully. Download the updated workbook.")
+            st.download_button(
+                label="Download updated workbook",
+                data=workbook_bytes,
+                file_name="Household_Expenses.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
+st.divider()
+st.subheader("4) Update Existing Categories")
+st.caption("Edit category values directly in Household_Expenses.xlsx and download the updated workbook without CSV merge.")
+maintenance_df = history_df.copy()
+if CATEGORY_COL not in maintenance_df.columns:
+    maintenance_df[CATEGORY_COL] = pd.NA
+
+editable_cols = [c for c in ["True Date", "Date", "Date Processed", "Date of Transaction", "Unique Id", "Description", "Payee", "Memo", "Amount", CATEGORY_COL] if c in maintenance_df.columns]
+if not editable_cols:
+    st.info("No editable columns found.")
+else:
+    edited_master = st.data_editor(
+        maintenance_df[editable_cols],
         use_container_width=True,
         num_rows="fixed",
         column_config={
-            "SuggestedCategorisation": st.column_config.TextColumn("SuggestedCategorisation", disabled=True),
-            "FinalCategorisation": st.column_config.TextColumn(
-                "FinalCategorisation",
-                help="Enter manually when no suggestion is provided.",
-            ),
-            "DuplicateFlag": st.column_config.CheckboxColumn("DuplicateFlag", disabled=True),
-            "DuplicateReason": st.column_config.TextColumn("DuplicateReason", disabled=True),
-            "SecondarySuggestedCategorisation": st.column_config.TextColumn("SecondarySuggestedCategorisation", disabled=True),
-            "SecondaryKeywords": st.column_config.TextColumn("SecondaryKeywords", disabled=True),
-            "SecondaryScore": st.column_config.NumberColumn("SecondaryScore", disabled=True, format="%.3f"),
+            CATEGORY_COL: st.column_config.TextColumn(CATEGORY_COL, help="Edit categories directly."),
         },
+        key="maintenance_editor",
     )
-    st.session_state["edited_df"] = edited_df
-
-with secondary_tab:
-    st.caption("Best alternative matches based on recurring keywords from workbook history.")
-    secondary_view = st.session_state["edited_df"].copy()
-    secondary_view = secondary_view[secondary_view["SuggestedCategorisation"].astype(str).str.strip() == ""]
-    secondary_view = secondary_view[
-        [
-            c
-            for c in [
-                "Unique Id",
-                "Description",
-                "Reference",
-                "Payee",
-                "Memo",
-                "Amount",
-                "SuggestedCategorisation",
-                "SecondarySuggestedCategorisation",
-                "SecondaryKeywords",
-                "SecondaryScore",
-                "FinalCategorisation",
-            ]
-            if c in secondary_view.columns
-        ]
-    ]
-    if secondary_view.empty:
-        st.info("No unmatched transactions for keyword suggestions.")
-    else:
-        st.dataframe(secondary_view, use_container_width=True, hide_index=True)
-        if st.button("Apply secondary suggestions to blank FinalCategorisation"):
-            edited = st.session_state["edited_df"].copy()
-            blank_final = edited["FinalCategorisation"].fillna("").astype(str).str.strip() == ""
-            has_secondary = edited["SecondarySuggestedCategorisation"].fillna("").astype(str).str.strip() != ""
-            mask = blank_final & has_secondary
-            edited.loc[mask, "FinalCategorisation"] = edited.loc[mask, "SecondarySuggestedCategorisation"]
-            st.session_state["edited_df"] = edited
-            st.success(f"Applied keyword suggestions to {int(mask.sum())} transactions.")
-
-edited_df = st.session_state["edited_df"].copy()
-
-approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
-if approve and st.button("Merge and Download Updated Workbook", type="primary"):
-    missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
-    if bool(missing.any()):
-        st.error("Some non-duplicate transactions still have blank FinalCategorisation. Please complete them before merging.")
-        st.stop()
-
-    merged = _merge_for_export(history_df, edited_df)
-    keyword_rules_out = _merge_keyword_rules(
-        keyword_rules,
-        _build_keyword_rules_from_history(merged, CATEGORY_COL if CATEGORY_COL in merged.columns else history_category_col),
-    )
-
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        merged.to_excel(writer, index=False, sheet_name="Master")
-        keyword_rules_out.to_excel(writer, index=False, sheet_name=KEYWORD_SHEET_NAME)
-
-    file_name = "Household_Expenses.xlsx"
-
-    st.success("Merged successfully. Download the updated workbook.")
-    st.download_button(
-        label="Download updated workbook",
-        data=output.getvalue(),
-        file_name=file_name,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if st.button("Download Workbook With Updated Categories", type="primary"):
+        updated = history_df.copy()
+        updated[CATEGORY_COL] = edited_master[CATEGORY_COL]
+        updated = _coerce_date_columns_for_excel(updated)
+        updated = _update_true_date(updated)
+        keyword_rules_out = _merge_keyword_rules(
+            keyword_rules_existing,
+            _build_keyword_rules_from_history(updated, CATEGORY_COL),
+        )
+        workbook_bytes = _build_workbook_bytes(updated, keyword_rules_out)
+        st.success("Updated categories applied. Download the workbook.")
+        st.download_button(
+            label="Download Household_Expenses.xlsx",
+            data=workbook_bytes,
+            file_name="Household_Expenses.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )

@@ -1,15 +1,15 @@
 # Household Expenditure Categorizer
 
 A Streamlit app that:
-1. Loads historical categorized transactions from `Household_Expenses.xlsx` in the repository root.
-2. Displays a dashboard from `Household_Expenses.xlsx` with month/quarter/year toggle, category summary table, stacked bar chart, and persistent category filters.
-2. Loads new transactions from one of two supported native bank `.csv` formats.
-3. Automatically detects and ignores any rows above the CSV header row.
-4. Auto-categorizes by exact reference match from `Household_Expenses.xlsx`.
-5. Provides a secondary keyword-based suggestion screen for unmatched transactions.
-6. Stores recurring keyword mappings on a second worksheet named `KeywordRules` within `Household_Expenses.xlsx`.
-7. Pauses for manual review/approval.
-6. Merges approved rows into an updated master workbook and writes a `Categorisation` column.
+1. Requires you to upload `Household_Expenses.xlsx` each session (the workbook is not stored in the repository).
+2. Displays a dashboard from the uploaded workbook with month/quarter/year toggle, category summary table, stacked bar chart, and persistent category filters.
+3. Loads new transactions from one of two supported native bank `.csv` formats.
+4. Automatically detects and ignores any rows above the CSV header row.
+5. Auto-categorizes with a single suggested category and match type (`Exact Match` or `Keyword Match`) from the uploaded workbook.
+6. Shows all workflows on one page in sequence (dashboard -> CSV categorization -> category maintenance).
+7. Stores recurring keyword mappings on a second worksheet named `KeywordRules` within `Household_Expenses.xlsx`.
+8. Supports direct category maintenance without CSV merge via an "Update Existing Categories" screen.
+9. Merges approved rows into an updated workbook and writes a `Categorisation` column.
 
 ## Supported CSV Headers
 
@@ -42,7 +42,7 @@ streamlit run app.py
 
 ## Notes
 
-- `Household_Expenses.xlsx` is the source of truth for category suggestions.
+- Upload `Household_Expenses.xlsx` each run; it is the source of truth for category suggestions.
 - The workbook should contain prior labels in `Categorisation` (or `Category`).
 - Auto-categorisation is strict reference lookup only:
   - CSV type 1: exact `Description` match
