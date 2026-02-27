@@ -643,12 +643,19 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         )
     )
 
+    y_min = float(dashboard_chart_df["Amount"].min()) if not dashboard_chart_df.empty else 0.0
+    label_gap = max(abs(y_min) * 0.03, 0.8)
+    label_base = y_min - max(abs(y_min) * 0.08, 1.0)
+    totals_df = totals_df.copy()
+    totals_df["LabelRank"] = range(len(totals_df))
+    totals_df["LabelY"] = totals_df["LabelRank"].map(lambda i: label_base - (label_gap if i % 2 else 0.0))
+
     total_labels = (
         alt.Chart(totals_df)
-        .mark_text(dy=-10, fontSize=11)
+        .mark_text(fontSize=11)
         .encode(
             x=alt.X("Period:N", sort=period_order),
-            y=alt.Y("TotalAmount:Q"),
+            y=alt.Y("LabelY:Q"),
             text=alt.Text("TotalDisplay:N"),
         )
     )
@@ -871,9 +878,20 @@ else:
         approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
         if approve and st.button("Merge and Download Updated Workbook", type="primary"):
             missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
-            if bool(missing.any()):
-                st.error("Some non-duplicate transactions still have blank FinalCategorisation. Please complete them before merging.")
-                st.stop()
+            missing_count = int(missing.sum())
+            requires_second_approval = missing_count > 0
+            if requires_second_approval:
+                warning_key = f"allow_blank_categories_{st.session_state['prediction_signature']}"
+                st.warning(
+                    f"{missing_count} non-duplicate transactions have blank FinalCategorisation. "
+                    "If you proceed, blanks will be kept in the merged workbook."
+                )
+                allow_blank = st.checkbox(
+                    "I re-approve merge with blank FinalCategorisation values",
+                    key=warning_key,
+                )
+                if not allow_blank:
+                    st.stop()
 
             merged = _merge_for_export(history_df, edited_df)
             keyword_rules_out = _merge_keyword_rules(
