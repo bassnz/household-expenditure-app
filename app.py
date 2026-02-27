@@ -643,19 +643,17 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         )
     )
 
-    y_min = float(dashboard_chart_df["Amount"].min()) if not dashboard_chart_df.empty else 0.0
-    label_gap = max(abs(y_min) * 0.03, 0.8)
-    label_base = y_min - max(abs(y_min) * 0.08, 1.0)
     totals_df = totals_df.copy()
     totals_df["LabelRank"] = range(len(totals_df))
-    totals_df["LabelY"] = totals_df["LabelRank"].map(lambda i: label_base - (label_gap if i % 2 else 0.0))
+    totals_df["LabelDY"] = totals_df["LabelRank"].map(lambda i: -4 if i % 2 == 0 else -18)
 
     total_labels = (
         alt.Chart(totals_df)
-        .mark_text(fontSize=11)
+        .mark_text(fontSize=11, clip=False)
         .encode(
             x=alt.X("Period:N", sort=period_order),
-            y=alt.Y("LabelY:Q"),
+            y=alt.value(396),
+            dy=alt.Datum("datum.LabelDY"),
             text=alt.Text("TotalDisplay:N"),
         )
     )
@@ -676,7 +674,7 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         )
         chart = chart + rolling_line
 
-    st.altair_chart(chart.properties(height=400), use_container_width=True)
+    st.altair_chart(chart.properties(height=430), use_container_width=True)
 
 
 def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
@@ -876,23 +874,25 @@ else:
 
         edited_df = st.session_state["edited_df"].copy()
         approve = st.checkbox("I approve these categories and want to merge into Household_Expenses.xlsx")
-        if approve and st.button("Merge and Download Updated Workbook", type="primary"):
-            missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
-            missing_count = int(missing.sum())
-            requires_second_approval = missing_count > 0
-            if requires_second_approval:
-                warning_key = f"allow_blank_categories_{st.session_state['prediction_signature']}"
-                st.warning(
-                    f"{missing_count} non-duplicate transactions have blank FinalCategorisation. "
-                    "If you proceed, blanks will be kept in the merged workbook."
-                )
-                allow_blank = st.checkbox(
-                    "I re-approve merge with blank FinalCategorisation values",
-                    key=warning_key,
-                )
-                if not allow_blank:
-                    st.stop()
+        missing = (edited_df["FinalCategorisation"].fillna("").astype(str).str.strip() == "") & (~edited_df["DuplicateFlag"].fillna(False))
+        missing_count = int(missing.sum())
+        needs_blank_approval = missing_count > 0
 
+        if approve and needs_blank_approval:
+            st.warning(
+                f"{missing_count} non-duplicate transactions have blank FinalCategorisation. "
+                "If you proceed, blanks will be kept in the merged workbook."
+            )
+        allow_blank = True
+        if needs_blank_approval:
+            warning_key = f"allow_blank_categories_{st.session_state['prediction_signature']}"
+            allow_blank = st.checkbox(
+                "I re-approve merge with blank FinalCategorisation values",
+                key=warning_key,
+            )
+
+        can_merge = approve and ((not needs_blank_approval) or allow_blank)
+        if can_merge and st.button("Merge and Download Updated Workbook", type="primary"):
             merged = _merge_for_export(history_df, edited_df)
             keyword_rules_out = _merge_keyword_rules(
                 keyword_rules,
