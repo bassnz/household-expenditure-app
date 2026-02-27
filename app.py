@@ -36,6 +36,8 @@ CATEGORY_COL = "Categorisation"
 LOWER_GROUP_CATEGORIES = {"Mortgage", "Savings", "Tax", "Income", "Uncategorised", "Payments", "Home Visa", "Work Visa", "Dividend"}
 KEYWORD_SHEET_NAME = "Keywords"
 KEYWORD_RULE_COLUMNS = ["Keyword", CATEGORY_COL, "MatchCount", "TotalCount", "Confidence", "LastUpdated"]
+APP_VERSION = "2026-02-27-dashboard-v2"
+
 STOPWORDS = {
     "the",
     "and",
@@ -58,6 +60,7 @@ STOPWORDS = {
 
 st.set_page_config(page_title="Transaction Categorizer", layout="wide")
 st.title("Transaction Categorizer")
+st.caption(f"App version: {APP_VERSION}")
 st.caption("Upload Household_Expenses.xlsx each session. Refresh keyword mappings and run CSV categorization.")
 
 
@@ -537,6 +540,7 @@ def _build_dashboard_frame(history_df: pd.DataFrame, category_col: str, period_m
 
 def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
     st.subheader("Spending Dashboard")
+    st.caption(f"Dashboard build marker: totals+rolling | {APP_VERSION}")
     period_mode = st.radio("Time period", options=["Month", "Quarter", "Year"], horizontal=True, key="period_mode")
 
     all_categories = (
@@ -573,6 +577,16 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         if checked:
             selected_categories.append(category)
 
+    rolling_window = st.number_input(
+        "Rolling average periods (x)",
+        min_value=1,
+        value=3,
+        step=1,
+        key="dashboard_rolling_window",
+        help="Applies to the selected period view (e.g. 3 months, 3 quarters, or 3 years).",
+    )
+    hide_rolling_line = st.toggle("Hide rolling average line", value=False, key="dashboard_hide_rolling")
+
     if not selected_categories:
         st.warning("Select at least one category to display the dashboard.")
         return
@@ -587,6 +601,9 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
         .fillna(0.0)
         .sort_index()
     )
+    totals_row = pd.DataFrame([pivot.sum(axis=0)], index=["Total"])
+    pivot = pd.concat([pivot, totals_row], axis=0)
+
     def _fmt_accounting(value: object) -> str:
         try:
             num = float(value)
@@ -596,22 +613,63 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
             return f"({abs(num):,.0f})"
         return f"{num:,.0f}"
 
-    st.dataframe(pivot.style.format(_fmt_accounting), use_container_width=True)
+    pivot_display = pivot.reset_index().rename(columns={"index": "Category"})
+    value_cols = [c for c in pivot_display.columns if c != "Category"]
+    st.dataframe(
+        pivot_display.style.format({c: _fmt_accounting for c in value_cols}),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     dashboard_chart_df = dashboard_df.copy()
     dashboard_chart_df["AmountDisplay"] = dashboard_chart_df["Amount"].map(_fmt_accounting)
-    chart = (
+    totals_df = (
+        dashboard_chart_df.groupby("Period", as_index=False)["Amount"]
+        .sum()
+        .rename(columns={"Amount": "TotalAmount"})
+    )
+    period_order = dashboard_df["Period"].drop_duplicates().tolist()
+    totals_df["TotalDisplay"] = totals_df["TotalAmount"].map(_fmt_accounting)
+    totals_df["RollingAverage"] = totals_df["TotalAmount"].rolling(window=int(rolling_window), min_periods=1).mean()
+
+    bars = (
         alt.Chart(dashboard_chart_df)
         .mark_bar()
         .encode(
-            x=alt.X("Period:N", title=period_mode),
+            x=alt.X("Period:N", title=period_mode, sort=period_order),
             y=alt.Y("Amount:Q", title="Total Amount"),
             color=alt.Color("Category:N", title="Categorisation"),
             tooltip=["Period", "Category", alt.Tooltip("AmountDisplay:N", title="Amount")],
         )
-        .properties(height=380)
     )
-    st.altair_chart(chart, use_container_width=True)
+
+    total_labels = (
+        alt.Chart(totals_df)
+        .mark_text(dy=-10, fontSize=11)
+        .encode(
+            x=alt.X("Period:N", sort=period_order),
+            y=alt.Y("TotalAmount:Q"),
+            text=alt.Text("TotalDisplay:N"),
+        )
+    )
+
+    chart = bars + total_labels
+    if not hide_rolling_line:
+        rolling_line = (
+            alt.Chart(totals_df)
+            .mark_line(color="#111827", strokeWidth=2)
+            .encode(
+                x=alt.X("Period:N", sort=period_order),
+                y=alt.Y("RollingAverage:Q", title="Total Amount"),
+                tooltip=[
+                    "Period",
+                    alt.Tooltip("RollingAverage:Q", title=f"Rolling Avg ({int(rolling_window)})", format=",.2f"),
+                ],
+            )
+        )
+        chart = chart + rolling_line
+
+    st.altair_chart(chart.properties(height=400), use_container_width=True)
 
 
 def _merge_for_export(history_df: pd.DataFrame, edited_df: pd.DataFrame) -> pd.DataFrame:
