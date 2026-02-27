@@ -645,20 +645,30 @@ def _render_dashboard(history_df: pd.DataFrame, category_col: str) -> None:
 
     totals_df = totals_df.copy()
     totals_df["LabelRank"] = range(len(totals_df))
-    totals_df["LabelDY"] = totals_df["LabelRank"].map(lambda i: -4 if i % 2 == 0 else -18)
+    totals_even = totals_df[totals_df["LabelRank"] % 2 == 0]
+    totals_odd = totals_df[totals_df["LabelRank"] % 2 == 1]
 
-    total_labels = (
-        alt.Chart(totals_df)
-        .mark_text(fontSize=11, clip=False)
+    total_labels_even = (
+        alt.Chart(totals_even)
+        .mark_text(fontSize=11, clip=False, dy=-4)
         .encode(
             x=alt.X("Period:N", sort=period_order),
             y=alt.value(396),
-            dy=alt.Datum("datum.LabelDY"),
             text=alt.Text("TotalDisplay:N"),
         )
     )
 
-    chart = bars + total_labels
+    total_labels_odd = (
+        alt.Chart(totals_odd)
+        .mark_text(fontSize=11, clip=False, dy=-18)
+        .encode(
+            x=alt.X("Period:N", sort=period_order),
+            y=alt.value(396),
+            text=alt.Text("TotalDisplay:N"),
+        )
+    )
+
+    chart = bars + total_labels_even + total_labels_odd
     if not hide_rolling_line:
         rolling_line = (
             alt.Chart(totals_df)
